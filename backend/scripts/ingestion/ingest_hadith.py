@@ -8,6 +8,10 @@ sub-task in the docs; that manual sampling step is separate from this script).
 Scoped to the six major collections for now: Bukhari, Muslim, Abu Dawud,
 Tirmidhi, Nasa'i, Ibn Majah.
 
+Language set (ar/en/ur/id/bn/tr) chosen by Muslim population by country (Pew
+Research), constrained to what this source actually offers per collection —
+Persian and Hindi were considered but aren't available here.
+
 Usage: python -m scripts.ingestion.ingest_hadith
 """
 import httpx
@@ -24,15 +28,26 @@ from scripts.ingestion.common import db_session, upsert_many, upsert_many_return
 CDN_BASE = "https://cdn.jsdelivr.net/gh/fawazahmed0/hadith-api@1/editions"
 SOURCE_DATASET = "fawazahmed0-hadith-api"
 
-# collection slug -> (display name, arabic edition, english edition, urdu edition)
+# collection slug -> (display name, {language_code: edition_prefix})
 COLLECTIONS = {
-    "bukhari": ("Sahih al-Bukhari", "ara-bukhari", "eng-bukhari", "urd-bukhari"),
-    "muslim": ("Sahih Muslim", "ara-muslim", "eng-muslim", "urd-muslim"),
-    "abudawud": ("Sunan Abu Dawud", "ara-abudawud", "eng-abudawud", "urd-abudawud"),
-    "tirmidhi": ("Jami At-Tirmidhi", "ara-tirmidhi", "eng-tirmidhi", "urd-tirmidhi"),
-    "nasai": ("Sunan an-Nasa'i", "ara-nasai", "eng-nasai", "urd-nasai"),
-    "ibnmajah": ("Sunan Ibn Majah", "ara-ibnmajah", "eng-ibnmajah", "urd-ibnmajah"),
+    "bukhari": ("Sahih al-Bukhari", "bukhari"),
+    "muslim": ("Sahih Muslim", "muslim"),
+    "abudawud": ("Sunan Abu Dawud", "abudawud"),
+    "tirmidhi": ("Jami At-Tirmidhi", "tirmidhi"),
+    "nasai": ("Sunan an-Nasa'i", "nasai"),
+    "ibnmajah": ("Sunan Ibn Majah", "ibnmajah"),
 }
+
+# language_code -> edition slug prefix, applied as "{prefix}-{collection_slug}"
+LANGUAGE_PREFIXES = {
+    "ar": "ara",
+    "en": "eng",
+    "ur": "urd",
+    "id": "ind",
+    "bn": "ben",
+    "tr": "tur",
+}
+TRANSLATION_LANGUAGES = ["en", "ur", "id", "bn", "tr"]  # everything except "ar"
 
 # Bukhari/Muslim (the Sahihayn) carry no per-hadith grades in the source —
 # they're collectively authenticated by scholarly consensus rather than
@@ -64,10 +79,13 @@ def ingest_books(session, collection_id: int, sections: dict) -> dict[int, int]:
     return book_id_by_number
 
 
-def ingest_collection(session, slug: str, name: str, ar_ed: str, en_ed: str, ur_ed: str) -> None:
-    ar_data = fetch_edition(ar_ed)
-    en_data = fetch_edition(en_ed)
-    ur_data = fetch_edition(ur_ed)
+def ingest_collection(session, slug: str, name: str, collection_slug: str) -> None:
+    editions = {
+        lang: fetch_edition(f"{prefix}-{collection_slug}")
+        for lang, prefix in LANGUAGE_PREFIXES.items()
+    }
+    ar_data = editions["ar"]
+    en_data = editions["en"]
 
     collection_id = upsert_one(
         session,
@@ -86,8 +104,10 @@ def ingest_collection(session, slug: str, name: str, ar_ed: str, en_ed: str, ur_
     book_id_by_number = ingest_books(session, collection_id, en_data["metadata"]["sections"])
     session.commit()
 
-    ar_by_number = {h["hadithnumber"]: h for h in ar_data["hadiths"]}
-    ur_by_number = {h["hadithnumber"]: h for h in ur_data["hadiths"]}
+    by_number_per_lang = {
+        lang: {h["hadithnumber"]: h for h in data["hadiths"]} for lang, data in editions.items()
+    }
+    ar_by_number = by_number_per_lang["ar"]
 
     hadith_rows = []
     for h in en_data["hadiths"]:
@@ -120,14 +140,12 @@ def ingest_collection(session, slug: str, name: str, ar_ed: str, en_ed: str, ur_
     print(f"  {name}: {len(hadith_id_by_number)} hadith")
 
     translation_rows = []
-    en_by_number = {h["hadithnumber"]: h for h in en_data["hadiths"]}
-    for number, hadith_id in hadith_id_by_number.items():
-        en_h = en_by_number.get(number)
-        if en_h:
-            translation_rows.append({"hadith_id": hadith_id, "language_code": "en", "text": en_h["text"]})
-        ur_h = ur_by_number.get(number)
-        if ur_h:
-            translation_rows.append({"hadith_id": hadith_id, "language_code": "ur", "text": ur_h["text"]})
+    for lang in TRANSLATION_LANGUAGES:
+        by_number = by_number_per_lang[lang]
+        for number, hadith_id in hadith_id_by_number.items():
+            h = by_number.get(number)
+            if h:
+                translation_rows.append({"hadith_id": hadith_id, "language_code": lang, "text": h["text"]})
     upsert_many(session, HadithTranslation, translation_rows, index_elements=["hadith_id", "language_code"])
     session.commit()
     print(f"  {name}: {len(translation_rows)} translation rows")
@@ -139,6 +157,7 @@ def ingest_collection(session, slug: str, name: str, ar_ed: str, en_ed: str, ur_
                 {"hadith_id": hadith_id, "grader_name": "Ijma (Sahihayn)", "grade": "sahih"}
             )
     else:
+        en_by_number = by_number_per_lang["en"]
         for number, hadith_id in hadith_id_by_number.items():
             en_h = en_by_number.get(number)
             for g in (en_h.get("grades") or []) if en_h else []:
@@ -156,9 +175,9 @@ def ingest_collection(session, slug: str, name: str, ar_ed: str, en_ed: str, ur_
 
 def main() -> None:
     with db_session() as session:
-        for slug, (name, ar_ed, en_ed, ur_ed) in COLLECTIONS.items():
+        for slug, (name, collection_slug) in COLLECTIONS.items():
             print(f"Ingesting {name}...")
-            ingest_collection(session, slug, name, ar_ed, en_ed, ur_ed)
+            ingest_collection(session, slug, name, collection_slug)
 
 
 if __name__ == "__main__":

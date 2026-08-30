@@ -19,7 +19,13 @@ from sqlalchemy import select
 from app.models.hadith import Hadith, HadithBook, HadithCollection, HadithGrading, HadithTranslation
 from app.models.quran import Ayah, Surah, Tafsir, Translation
 from scripts.ingestion.common import db_session
-from scripts.ingestion.ingest_hadith import COLLECTIONS, SAHIHAYN, fetch_edition
+from scripts.ingestion.ingest_hadith import (
+    COLLECTIONS,
+    LANGUAGE_PREFIXES,
+    SAHIHAYN,
+    TRANSLATION_LANGUAGES,
+    fetch_edition,
+)
 from scripts.ingestion.ingest_quran import ARABIC_EDITION, TRANSLATION_EDITIONS, fetch
 from scripts.ingestion.ingest_tafsir import EDITIONS as TAFSIR_EDITIONS
 from scripts.ingestion.ingest_tafsir import normalize as normalize_tafsir
@@ -137,12 +143,14 @@ def verify_tafsir(session) -> None:
 def verify_hadith(session) -> None:
     global checked
     print("\n=== Hadith ===")
-    for slug, (name, ar_ed, en_ed, ur_ed) in COLLECTIONS.items():
-        ar_data = fetch_edition(ar_ed)
-        en_data = fetch_edition(en_ed)
-        ur_data = fetch_edition(ur_ed)
-        ar_by_number = {h["hadithnumber"]: h for h in ar_data["hadiths"]}
-        ur_by_number = {h["hadithnumber"]: h for h in ur_data["hadiths"]}
+    for slug, (name, collection_slug) in COLLECTIONS.items():
+        editions = {
+            lang: fetch_edition(f"{prefix}-{collection_slug}") for lang, prefix in LANGUAGE_PREFIXES.items()
+        }
+        en_data = editions["en"]
+        by_number_per_lang = {
+            lang: {h["hadithnumber"]: h for h in data["hadiths"]} for lang, data in editions.items()
+        }
 
         collection = session.scalar(select(HadithCollection).where(HadithCollection.name == name))
         if collection is None:
@@ -157,22 +165,16 @@ def verify_hadith(session) -> None:
                 .where(HadithBook.collection_id == collection.id)
             )
         }
-        db_en = dict(
-            session.execute(
-                select(Hadith.id, HadithTranslation.text)
-                .join(HadithTranslation, HadithTranslation.hadith_id == Hadith.id)
-                .join(HadithBook, HadithBook.id == Hadith.book_id)
-                .where(HadithBook.collection_id == collection.id, HadithTranslation.language_code == "en")
-            ).all()
-        )
-        db_ur = dict(
-            session.execute(
-                select(Hadith.id, HadithTranslation.text)
-                .join(HadithTranslation, HadithTranslation.hadith_id == Hadith.id)
-                .join(HadithBook, HadithBook.id == Hadith.book_id)
-                .where(HadithBook.collection_id == collection.id, HadithTranslation.language_code == "ur")
-            ).all()
-        )
+        db_translations: dict[str, dict[int, str]] = {}
+        for lang in TRANSLATION_LANGUAGES:
+            db_translations[lang] = dict(
+                session.execute(
+                    select(Hadith.id, HadithTranslation.text)
+                    .join(HadithTranslation, HadithTranslation.hadith_id == Hadith.id)
+                    .join(HadithBook, HadithBook.id == Hadith.book_id)
+                    .where(HadithBook.collection_id == collection.id, HadithTranslation.language_code == lang)
+                ).all()
+            )
         db_gradings: dict[int, set] = {}
         for h_id, grader, grade in session.execute(
             select(Hadith.id, HadithGrading.grader_name, HadithGrading.grade)
@@ -197,18 +199,17 @@ def verify_hadith(session) -> None:
                 continue
             h_id, db_text_ar = entry
 
-            ar_h = ar_by_number.get(number)
+            ar_h = by_number_per_lang["ar"].get(number)
             expected_ar = ar_h["text"] if ar_h else None
             if db_text_ar != expected_ar:
                 record_mismatch(name, f"hadith #{number} text_ar mismatch")
 
-            if db_en.get(h_id) != h["text"]:
-                record_mismatch(name, f"hadith #{number} en translation mismatch")
-
-            ur_h = ur_by_number.get(number)
-            expected_ur = ur_h["text"] if ur_h else None
-            if ur_h is not None and db_ur.get(h_id) != expected_ur:
-                record_mismatch(name, f"hadith #{number} ur translation mismatch")
+            for lang in TRANSLATION_LANGUAGES:
+                lang_h = by_number_per_lang[lang].get(number)
+                if lang_h is None:
+                    continue
+                if db_translations[lang].get(h_id) != lang_h["text"]:
+                    record_mismatch(name, f"hadith #{number} {lang} translation mismatch")
 
             actual_gradings = db_gradings.get(h_id, set())
             if slug in SAHIHAYN:
