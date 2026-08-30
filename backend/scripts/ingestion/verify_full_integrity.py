@@ -17,10 +17,12 @@ import httpx
 from sqlalchemy import select
 
 from app.models.hadith import Hadith, HadithBook, HadithCollection, HadithGrading, HadithTranslation
-from app.models.quran import Ayah, Surah, Translation
+from app.models.quran import Ayah, Surah, Tafsir, Translation
 from scripts.ingestion.common import db_session
 from scripts.ingestion.ingest_hadith import COLLECTIONS, SAHIHAYN, fetch_edition
 from scripts.ingestion.ingest_quran import ARABIC_EDITION, TRANSLATION_EDITIONS, fetch
+from scripts.ingestion.ingest_tafsir import EDITIONS as TAFSIR_EDITIONS
+from scripts.ingestion.ingest_tafsir import normalize as normalize_tafsir
 
 mismatches = []
 checked = 0
@@ -98,6 +100,38 @@ def verify_quran(session) -> None:
                 elif db_text != ayah["text"]:
                     record_mismatch(f"translations[{lang}]", f"{key} text mismatch")
         print(f"  '{lang}' translations checked: {n}")
+
+
+def verify_tafsir(session) -> None:
+    global checked
+    print("\n=== Tafsir ===")
+    for lang, (edition_slug, source_name) in TAFSIR_EDITIONS.items():
+        db_text = {
+            (a_num, s_num): t
+            for t, a_num, s_num in session.execute(
+                select(Tafsir.text, Ayah.ayah_number, Surah.number)
+                .join(Ayah, Ayah.id == Tafsir.ayah_id)
+                .join(Surah, Surah.id == Ayah.surah_id)
+                .where(Tafsir.language_code == lang, Tafsir.source_name == source_name)
+            ).all()
+        }
+        n = 0
+        for surah_number in range(1, 115):
+            resp = httpx.get(
+                f"https://cdn.jsdelivr.net/gh/spa5k/tafsir_api@main/tafsir/{edition_slug}/{surah_number}.json",
+                timeout=60,
+            )
+            resp.raise_for_status()
+            for entry in normalize_tafsir(resp.json()):
+                key = (entry["ayah"], entry["surah"])
+                n += 1
+                text = db_text.get(key)
+                if text is None:
+                    record_mismatch(f"tafsir[{lang}]", f"{key} missing from db")
+                elif text != entry["text"]:
+                    record_mismatch(f"tafsir[{lang}]", f"{key} text mismatch")
+        checked += n
+        print(f"  '{lang}' tafsir checked: {n}")
 
 
 def verify_hadith(session) -> None:
@@ -194,6 +228,7 @@ def verify_hadith(session) -> None:
 def main() -> None:
     with db_session() as session:
         verify_quran(session)
+        verify_tafsir(session)
         verify_hadith(session)
 
     print(f"\n{'=' * 50}")

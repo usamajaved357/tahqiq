@@ -39,6 +39,7 @@ class Translation(Base):
 
 class Tafsir(Base):
     __tablename__ = "tafsirs"
+    __table_args__ = (UniqueConstraint("ayah_id", "source_name", "language_code"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     ayah_id: Mapped[int] = mapped_column(ForeignKey("ayahs.id"))
