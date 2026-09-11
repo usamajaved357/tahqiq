@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from app.models.hadith import Hadith, HadithBook, HadithCollection, HadithGrading, HadithTranslation
 from app.models.quran import Ayah, Surah, Tafsir, Translation
-from scripts.ingestion.common import db_session
+from scripts.ingestion.common import db_session, hadith_db_session
 from scripts.ingestion.ingest_hadith import (
     COLLECTIONS,
     LANGUAGE_PREFIXES,
@@ -230,6 +230,7 @@ def main() -> None:
     with db_session() as session:
         verify_quran(session)
         verify_tafsir(session)
+    with hadith_db_session() as session:
         verify_hadith(session)
 
     print(f"\n{'=' * 50}")

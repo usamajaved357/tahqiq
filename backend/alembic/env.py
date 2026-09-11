@@ -1,3 +1,4 @@
+import os
 import sys
 from logging.config import fileConfig
 from pathlib import Path
@@ -16,7 +17,13 @@ import app.models  # noqa: E402,F401
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+
+# ALEMBIC_TARGET=hadith runs migrations against the Hadith-domain Neon DB
+# instead of the primary Supabase DB. Both share the same Base.metadata (see
+# app/core/db.py) — target picks which physical database gets the schema.
+target = os.environ.get("ALEMBIC_TARGET", "primary")
+db_url = settings.HADITH_DATABASE_URL if target == "hadith" else settings.DATABASE_URL
+config.set_main_option("sqlalchemy.url", db_url)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

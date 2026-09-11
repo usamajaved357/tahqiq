@@ -4,12 +4,28 @@ from typing import Iterable
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.core.db import SessionLocal
+from app.core.db import HadithSessionLocal, SessionLocal
 
 
 @contextmanager
 def db_session():
+    """Session against the primary DB (Supabase) — Quran, tafsir, users, embeddings."""
     session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+@contextmanager
+def hadith_db_session():
+    """Session against the Hadith-domain DB (Neon) — hadiths, translations,
+    gradings, books, collections. See app/core/db.py for why these are split."""
+    session = HadithSessionLocal()
     try:
         yield session
         session.commit()

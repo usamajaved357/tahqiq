@@ -23,7 +23,7 @@ from app.models.hadith import (
     HadithGrading,
     HadithTranslation,
 )
-from scripts.ingestion.common import db_session, upsert_many, upsert_many_returning, upsert_one
+from scripts.ingestion.common import hadith_db_session, upsert_many, upsert_many_returning, upsert_one
 
 CDN_BASE = "https://cdn.jsdelivr.net/gh/fawazahmed0/hadith-api@1/editions"
 SOURCE_DATASET = "fawazahmed0-hadith-api"
@@ -174,7 +174,7 @@ def ingest_collection(session, slug: str, name: str, collection_slug: str) -> No
 
 
 def main() -> None:
-    with db_session() as session:
+    with hadith_db_session() as session:
         for slug, (name, collection_slug) in COLLECTIONS.items():
             print(f"Ingesting {name}...")
             ingest_collection(session, slug, name, collection_slug)

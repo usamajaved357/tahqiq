@@ -9,13 +9,13 @@ from sqlalchemy import func, select
 
 from app.models.hadith import Hadith, HadithBook, HadithCollection, HadithTranslation
 from app.models.quran import Ayah, Surah, Translation
-from scripts.ingestion.common import db_session
+from scripts.ingestion.common import db_session, hadith_db_session
 
 EXPECTED_SURAHS = 114
 EXPECTED_AYAHS = 6236
 
 
-def check_counts(session) -> None:
+def check_quran_counts(session) -> None:
     surah_count = session.scalar(select(func.count()).select_from(Surah))
     ayah_count = session.scalar(select(func.count()).select_from(Ayah))
     translation_count = session.scalar(
@@ -36,6 +36,8 @@ def check_counts(session) -> None:
     )
     print(f"ayahs missing an 'en' translation: {ayahs_without_en}")
 
+
+def check_hadith_counts(session) -> None:
     print()
     for name, count in session.execute(
         select(HadithCollection.name, func.count(Hadith.id))
@@ -59,7 +61,7 @@ def check_counts(session) -> None:
     print(f"hadith missing an 'en' translation: {hadith_without_en}")
 
 
-def spot_check(session) -> None:
+def spot_check_quran(session) -> None:
     print("\n--- spot checks ---")
     ayah = session.execute(
         select(Ayah.text_ar)
@@ -68,6 +70,8 @@ def spot_check(session) -> None:
     ).scalar_one_or_none()
     print(f"Surah 1:1 (Al-Fatiha) text_ar: {ayah}")
 
+
+def spot_check_hadith(session) -> None:
     hadith = session.execute(
         select(Hadith.text_ar)
         .join(HadithBook, HadithBook.id == Hadith.book_id)
@@ -79,8 +83,11 @@ def spot_check(session) -> None:
 
 def main() -> None:
     with db_session() as session:
-        check_counts(session)
-        spot_check(session)
+        check_quran_counts(session)
+        spot_check_quran(session)
+    with hadith_db_session() as session:
+        check_hadith_counts(session)
+        spot_check_hadith(session)
 
 
 if __name__ == "__main__":
