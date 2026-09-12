@@ -210,7 +210,7 @@ def extract_companion_name(companion_field: str) -> tuple[str, str | None] | Non
     return last, parent
 
 
-STRUCTURAL_LINK_WORDS = {"بن", "ابن", "بنت", "ابنة"}
+STRUCTURAL_LINK_WORDS = {"بن", "ابن", "بنت", "ابنة", "ابي", "ابو"}
 
 # "الله" is part of "عبد الله" (Abdullah) — one of the most common companion
 # names (Ibn Umar, Ibn Abbas, Ibn Amr, Ibn Mas'ud, Ibn al-Zubayr are all
@@ -237,14 +237,34 @@ def _distinctive_words(name: str) -> list[str]:
     matched (and genuinely correct) hadith ever repeats — and false-rejected
     it. So the first substantive word (the ism) is always kept, plus the
     single longest word among the rest, rather than ranking purely by
-    length. Pure linking words ("بن"/"ابن"/"بنت"/"ابنة") are structural, not
-    identifying, and are never picked on their own."""
+    length. Pure linking/kunya words ("بن"/"ابن"/"بنت"/"ابنة"/"أبي"/"أبو")
+    are structural, not identifying, and are never picked on their own — a
+    companion cited as just "أبي سعيد" (Abu Sa'id) needs "سعيد" to do the
+    actual distinguishing, since "أبي" alone recurs in dozens of unrelated
+    companions' kunyas (Abu Huraira, Abu Bakr, Abu al-Darda', ...) and would
+    make the check pass against almost any hadith with any "Abu X" narrator
+    mentioned anywhere in its isnad."""
     words = [
         w for w in normalize(name).split()
         if len(w) >= 3 and w not in STRUCTURAL_LINK_WORDS and w not in UNIVERSAL_WORDS
     ]
     if not words:
-        return []
+        # The whole name reduced to nothing once kunya/linking words were
+        # excluded — confirmed on real data: the companion "أُبَيّ" (Ubayy
+        # ibn Ka'b, a real proper name) normalizes to the exact same string
+        # as the generic kunya word "أبي" ("my father" / the Abu- prefix),
+        # so excluding it here would leave zero words to check and — since
+        # check_companion_in_text treats "nothing distinctive" as "don't
+        # false-reject" — silently turn into an unconditional pass, masking
+        # a real mismatch (that specific cluster's second hadith was
+        # actually Ibn Abbas's report, not Ubayy's, and this bug let it
+        # through). Falling back to the raw word here (without the kunya
+        # exclusion) keeps a real check in place for this edge case, at the
+        # cost of the same weak-word risk the exclusion exists to prevent —
+        # better than no check at all.
+        words = [w for w in normalize(name).split() if len(w) >= 3 and w not in UNIVERSAL_WORDS]
+        if not words:
+            return []
     first = words[0]
     rest = sorted(words[1:], key=lambda w: (-len(w), w))
     result = [first]
