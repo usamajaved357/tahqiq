@@ -189,31 +189,145 @@ class ParsedHadith:
     serial: str  # this edition's own printed number, as a string of Eastern digits
     heading: str | None  # chapter/companion heading in effect when this hadith started
     text: str = ""  # isnad + matn, original diacritics preserved, footnote markers left in place
-    footnote_text: str = ""  # this hadith's slice of the page(s)' footnote text
+    footnote_text: str = ""  # this hadith's OWN footnote content, reassembled from the
+    # numbered segments its own inline (N) markers actually reference — see
+    # _FootnoteAssembler below, not a naive per-page concatenation.
     page_ids: list[str] = field(default_factory=list)
+
+
+# Matches this edition's inline footnote-reference markers as they appear in
+# BODY text, e.g. "...جَرْحَاهُمْ (٢)." — one or more per hadith, numbered
+# starting at 1 WITHIN each hadith (confirmed: a hadith's own markers always
+# restart at "(١)", they are not a running count across the whole page).
+_INLINE_MARKER_RE = re.compile(rf"\(\s*[{DIGITS}]+\s*\)")
+
+# Splits a page's raw "foot" field into its own numbered segments. A leading
+# segment with no "(N)" prefix, itself starting with "=", is Shamela's own
+# convention for "this text continues the last still-open footnote from the
+# previous page" (confirmed real: a footnote whose triggering marker and
+# whose printed text straddle a page break). Every other segment starts with
+# its own "(N)" — but a footnote's own BODY also cites other hadith by
+# number in the exact same "(N)" shape (e.g. "وأخرجه البخاري (٧٤١٢)"), and
+# those must NOT be mistaken for a new footnote boundary. Confirmed
+# discriminator, checked against real data: a true footnote-start marker is
+# always preceded by "." with NO space ("...بهذا الإسناد.(٢) ..."); a
+# citation number is always preceded by a space or other non-period
+# character ("...أخرجه مسلم (١٨١٢) ..."). The lookbehind enforces this.
+_FOOTNOTE_SEGMENT_RE = re.compile(rf"(?<![^.])\(\s*[{DIGITS}]+\s*\)")
+
+
+class _FootnoteAssembler:
+    """Correctly attributes each page's footnote text to the specific hadith
+    (and specific inline marker within that hadith) it actually belongs to.
+
+    The naive approach — concatenate every page's whole "foot" field and hand
+    it to whichever hadith is still open when that page finishes — is WRONG
+    whenever a hadith's own body ends partway through a page (which is most
+    of the time): that hadith's own footnote ends up attributed to whatever
+    LATER hadith happens to still be pending when the page's foot field is
+    finally read, not to the hadith whose markers it actually explains.
+    Confirmed on real data: hadith #٢٠٧٩٢ has two inline markers "(١)"/"(٢)"
+    in its own body but an empty footnote_text under the naive approach,
+    while its footnote content (including a "=" page-break continuation)
+    was found filed entirely under the NEXT hadith, #٢٠٧٩٣.
+
+    Model: footnotes are typeset at the bottom of the SAME page the
+    triggering body text appears on (with a "=" continuation onto the next
+    page's block when a footnote's own text is long enough to straddle the
+    break). So markers are seen, and footnote segments arrive, in the same
+    left-to-right document order — this is tracked as one FIFO queue rather
+    than per-page state, which is what makes it robust across a hadith body
+    (and its markers) spanning multiple pages.
+    """
+
+    def __init__(self) -> None:
+        self._queue: list[tuple[ParsedHadith, int]] = []
+        self._resolved: dict[tuple[int, int], list[str]] = {}
+        self._last_key: tuple[int, int] | None = None
+        # Counts up per entry and is NEVER decremented by dequeuing — the
+        # queue itself drains as footnotes are consumed, so it can't be used
+        # to derive "how many markers has this entry had so far" once a
+        # multi-page entry's earlier markers have already been resolved.
+        self._entry_marker_count: dict[int, int] = {}
+        # Diagnostics only: the queue length just before each dequeue is a
+        # direct measure of drift (markers seen but not yet footnoted). A
+        # small, bounded value (0-2) is the normal "footnote lands a page
+        # later" case; if this grows unboundedly over the book, the FIFO
+        # assumption is wrong and results should not be trusted blindly.
+        self.max_queue_depth = 0
+        self.queue_depth_at_dequeue: list[int] = []
+
+    def note_markers(self, entry: ParsedHadith, text_chunk: str) -> None:
+        """Call with each piece of ORIGINAL (marker-containing) body text as
+        it's appended to `entry`, in order. Registers one queue slot per
+        inline marker found, numbered by position within THIS entry."""
+        for _ in _INLINE_MARKER_RE.finditer(text_chunk):
+            count = self._entry_marker_count.get(id(entry), 0) + 1
+            self._entry_marker_count[id(entry)] = count
+            self._queue.append((entry, count))
+            self.max_queue_depth = max(self.max_queue_depth, len(self._queue))
+
+    def consume_page_foot(self, foot: str) -> None:
+        """Call once per page with that page's raw "foot" field, after every
+        marker on that page has already been registered via note_markers()."""
+        if not foot:
+            return
+        pos = 0
+        first_match = _FOOTNOTE_SEGMENT_RE.search(foot)
+        leading = foot[: first_match.start()] if first_match else foot
+        if leading.lstrip().startswith("="):
+            # continuation of the most recently dequeued marker's footnote,
+            # printed at the top of this page before this page's own "(N)"
+            # segments begin (confirmed real: a footnote long enough to
+            # straddle a page break).
+            if self._last_key is not None:
+                self._resolved.setdefault(self._last_key, []).append(leading.lstrip("= \n"))
+            pos = len(leading)
+        # now split the remainder into (marker, following-text) segments in order
+        matches = list(_FOOTNOTE_SEGMENT_RE.finditer(foot[pos:]))
+        base = pos
+        for i, m in enumerate(matches):
+            seg_start = base + m.start()
+            seg_end = base + matches[i + 1].start() if i + 1 < len(matches) else len(foot)
+            segment_text = foot[seg_start:seg_end]
+            if not self._queue:
+                # no known marker awaiting this text — front matter, a stray
+                # reference, or a genuine gap; do not guess an attribution.
+                continue
+            self.queue_depth_at_dequeue.append(len(self._queue))
+            key_entry, key_number = self._queue.pop(0)
+            key = (id(key_entry), key_number)
+            self._resolved.setdefault(key, []).append(segment_text)
+            self._last_key = key
+
+    def footnote_for(self, entry: ParsedHadith, marker_count: int) -> str:
+        parts = []
+        for i in range(1, marker_count + 1):
+            parts.extend(self._resolved.get((id(entry), i), []))
+        return "".join(parts).strip()
 
 
 def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
     """Walk pages in order, tracking the current heading, and split hadith
-    text at each numbered start. A hadith's footnote text is the
-    concatenation of every page its body text touches — imprecise when two
-    hadith share a page and both have footnotes (their footnote text gets
-    merged), a known limitation flagged for the caller rather than silently
-    guessed away."""
+    text at each numbered start. Footnote text is attributed per-marker via
+    `_FootnoteAssembler`, not by naive per-page concatenation (see its
+    docstring for why the naive approach silently misattributes footnotes to
+    the wrong hadith in the common case of a hadith's body ending mid-page)."""
     entries: list[ParsedHadith] = []
     unparsed_log: list[dict] = []
+    assembler = _FootnoteAssembler()
+    marker_counts: dict[int, int] = {}
 
     current_heading: str | None = None
     pending: ParsedHadith | None = None
     buffer = ""
     buffer_pages: list[str] = []
-    buffer_foot = ""
 
     def finalize() -> None:
         if pending is None:
             return
         pending.text = buffer.strip()
-        pending.footnote_text = buffer_foot.strip()
+        pending.footnote_text = assembler.footnote_for(pending, marker_counts.get(id(pending), 0))
         pending.page_ids = list(buffer_pages)
         entries.append(pending)
 
@@ -228,7 +342,7 @@ def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
         if titles:
             finalize()
             pending = None
-            buffer, buffer_pages, buffer_foot = "", [], ""
+            buffer, buffer_pages = "", []
             current_heading = strip_with_map(titles[-1])[0].strip()
 
         stripped, idx_map = strip_with_map(remaining)
@@ -236,18 +350,29 @@ def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
         for m in HADITH_START_RE.finditer(stripped):
             orig_start = idx_map[m.start()] if m.start() < len(idx_map) else len(remaining)
             orig_end = idx_map[m.end() - 1] + 1 if m.end() - 1 < len(idx_map) else len(remaining)
-            buffer += remaining[pos:orig_start]
+            chunk = remaining[pos:orig_start]
+            buffer += chunk
             buffer_pages.append(page_id)
+            if pending is not None:
+                assembler.note_markers(pending, chunk)
+                marker_counts[id(pending)] = marker_counts.get(id(pending), 0) + len(
+                    _INLINE_MARKER_RE.findall(chunk)
+                )
             finalize()
             pending = ParsedHadith(serial=m.group(1), heading=current_heading)
-            buffer, buffer_pages, buffer_foot = "", [], ""
+            buffer, buffer_pages = "", []
             pos = orig_end
 
-        buffer += remaining[pos:]
+        tail_chunk = remaining[pos:]
+        buffer += tail_chunk
         if page_id not in buffer_pages:
             buffer_pages.append(page_id)
-        if foot:
-            buffer_foot = (buffer_foot + "\n" + foot) if buffer_foot else foot
+        if pending is not None and tail_chunk:
+            assembler.note_markers(pending, tail_chunk)
+            marker_counts[id(pending)] = marker_counts.get(id(pending), 0) + len(
+                _INLINE_MARKER_RE.findall(tail_chunk)
+            )
+        assembler.consume_page_foot(foot)
 
         if pending is None and not titles and remaining.strip() and not buffer.strip():
             unparsed_log.append({"id": page_id, "reason": "no heading/hadith context yet"})
