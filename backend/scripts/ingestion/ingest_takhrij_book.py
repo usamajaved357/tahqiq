@@ -14,6 +14,13 @@ Footnote-reference markers left inline in the parsed text ("(¬N)" or plain
 not part of the hadith itself, and every other collection in this database
 stores plain text without them.
 
+A "•" character is also stripped: confirmed (by checking real occurrences
+against their surrounding text) to be this edition's own typographic marker
+for "a new numbered item begins here," not hadith content — it shows up at
+the tail of an entry's buffered text right before the next entry's serial
+number, which the boundary regex consumes starting at the digit, leaving
+the bullet stranded on the previous entry.
+
 Usage: python -m scripts.ingestion.ingest_takhrij_book <parsed.json> <collection_name> <source_tag>
 """
 import json
@@ -24,6 +31,7 @@ from app.models.hadith import Hadith, HadithBook, HadithCollection, HadithGradin
 from scripts.ingestion.common import hadith_db_session, upsert_many, upsert_many_returning, upsert_one
 
 FOOTNOTE_MARKER_RE = re.compile(r"\(\s*¬?[٠-٩]+\s*\)")
+BULLET_MARKER_RE = re.compile(r"•")
 
 # Ordered so a more specific phrase ("صحيح لغيره") is checked before the
 # plainer one it contains ("صحيح") would otherwise also match.
@@ -47,7 +55,9 @@ GRADE_BY_GROUP = {f"g{i}": grade for i, (_, grade) in enumerate(GRADE_PATTERNS)}
 
 
 def clean_text(text: str) -> str:
-    return re.sub(r"\s+", " ", FOOTNOTE_MARKER_RE.sub("", text)).strip()
+    text = FOOTNOTE_MARKER_RE.sub("", text)
+    text = BULLET_MARKER_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def extract_grade(footnote_text: str) -> str | None:

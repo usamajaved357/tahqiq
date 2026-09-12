@@ -46,6 +46,72 @@ markup since they come from the same publisher's Shamela editions):
   - Musnad Ahmad is organized by companion (headings name a sahabi's
     musnad), the four Sunan-style books by fiqh topic — structurally
     identical to parse for our purposes, since both just use heading spans.
+  - The boundary-verb set is NOT limited to حدثنا/أخبرنا/حدثني/وقال/قال.
+    Musnad Ahmad's editors use several other classical transmission
+    formulas to open a new numbered hadith without repeating "حدثنا":
+    وحدثنا/حدثناه/وحدثناه (same verb, prefixed/suffixed), قرأت/قرئ
+    ("recited to" / "was recited to" — the qira'ah transmission mode, a
+    real alternative to سماع), وبهذا (الإسناد)/وبإسناده/وبه ("and with
+    this/his isnad"), وذكر ("and he mentioned"), وجدت (في كتاب أبي)
+    ("I found in my father's book" — 'Abdullah ibn Ahmad's own formula
+    for hadith he added from his father's papers rather than heard
+    directly), وسمعت ("and I heard"), وعن ("and from [narrator]").
+    Confirmed real and not a parser artifact: without these, a numbered
+    entry using one of these verbs silently appended into the PRECEDING
+    hadith's text instead of starting its own (e.g. hadith ٢٠٨٨٥'s stored
+    text ran on to include "٢٠٨٨٦ - وبهذا الإسناد..." verbatim before this
+    was added). Several superficially similar "N - <word>" occurrences are
+    NOT hadith and must NOT be added as triggers — they come from the
+    editor's front-matter (numbered lists of manuscript copies, the
+    author's other books, biographical notices, editorial-methodology
+    notes): نسخة, وروى, كتاب, وأما, وضعنا, وفيه, قطعة. These were checked
+    against their actual source context (not assumed) before exclusion.
+  - A second, separate composite-serial format was found alongside the
+    "N/ M" isnad-variant format: "N م" (and occasionally "N م M"), e.g.
+    "٢٢٣٤٥ م" — "م" here abbreviates "متن" (matn), marking a recorded
+    variant WORDING of the same base hadith number rather than a variant
+    isnad. Confirmed genuine on 41 distinct real occurrences, all followed
+    by real isnad/matn text (never front matter). Captured as part of the
+    serial for the same reason as "N/ M": discarding it would silently
+    collide multiple distinct matn-variants onto one base serial.
+  - Also: وقال/قال were previously required to be followed by whitespace
+    to avoid matching "قالت"/"قالوا" (a different narrator/grammatical
+    person, not a new hadith) — real cases exist where a colon follows
+    instead ("وَقَالَ: ..."), so the boundary now accepts whitespace OR a
+    colon after these two verbs specifically.
+  - Sunan al-Kubra (a different work/editorial team than Musnad Ahmad) uses
+    a substantially different verb mix — checked independently against its
+    own raw source before assuming Musnad Ahmad's trigger set transferred
+    (see docs/HADITH_CROSS_REFERENCING.md's "sharper lesson" — an exhaustive
+    DB-vs-parse diff only proves fidelity to whatever the parser produced,
+    never that the trigger list is complete for a NEW book). Nasa'i-style
+    editions favor أخبرنا/أخبرني over حدثنا, plus وأخبرنا/وأخبرني/وحدثني,
+    أخبر (bare, subject-after-verb word order), أنبأنا/أنبأني (classical
+    synonym of أخبر*), أملى ("dictated to us"), وفيما ("and among what
+    [so-and-so] read to us" — a قراءة-mode variant, NOT to be confused with
+    Musnad Ahmad's unrelated front-matter word وفيه), and bare عن (a
+    compressed isnad style that starts directly with "from so-and-so" with
+    no verb at all).
+  - Short/generic triggers (عن, وعن, وبه, bare أخبر) require a trailing
+    space/colon rather than a bare substring lookahead. Confirmed necessary,
+    not defensive over-caution: an early version used a bare "عن" lookahead
+    and it matched inside "عِنَايَة" (interest/care) — a front-matter
+    table-of-contents entry in Musnad Ahmad's introduction ("مقدمة
+    التحقيق"), not a hadith — because "عن" is a letter-prefix of many
+    unrelated words. Every trigger is still gated on a preceding "digit -"
+    the source itself printed, so requiring a trailing boundary too does not
+    meaningfully reduce recall on genuine hadith, only on this false-positive
+    class.
+  - A small number of entries (~9 in Sunan al-Kubra, confirmed by checking
+    each occurrence's actual context) open with a bare narrator's PROPER
+    NAME and no verb at all before a transmission-mode phrase appears later
+    in the sentence (e.g. "الحارث بن مسكين، قراءة عليه..."). A generic
+    "any name" trigger is unsafe — common name words appear constantly
+    mid-isnad and would cause severe over-splitting. Only "الحارث" (74
+    occurrences, verified 74/74 to be this one specific narrator, "الحارث
+    بن مسكين") is special-cased as a literal trigger; the handful of other
+    one-off name-first openings are documented as a known residual
+    limitation rather than guessed at generically.
 """
 import json
 import re
@@ -55,8 +121,52 @@ from dataclasses import dataclass, field
 DIGITS = "٠١٢٣٤٥٦٧٨٩"
 DIACRITIC_RE = re.compile(r"[ً-ْٰۖ-ۭ]")
 TITLE_RE = re.compile(r"<span data-type=['\"]title['\"][^>]*>(.*?)</span>")
+
+# Serial: a base number, optionally with a "/M" isnad-variant suffix or a
+# "م[ M]" matn-variant suffix (see module docstring — both are real,
+# distinct composite-numbering conventions confirmed on actual data).
+_SERIAL = rf"[{DIGITS}]+(?:\s*/\s*[{DIGITS}]+|\s+م(?:\s*[{DIGITS}]+)?)?"
+
+# Boundary-trigger verbs, confirmed genuine against real source context (see
+# module docstring for the full list checked and why each false-positive
+# candidate — نسخة/وروى/كتاب/وأما/وضعنا/وفيه/قطعة/فهرس/ترتيب/القيام/نبهنا/
+# أبو/عبد/علي/حديث (front matter: manuscript-copy lists, bibliographies,
+# editorial-methodology notes, and a companion/topic index) — was excluded).
+_TRIGGERS = (
+    r"حدثنا|أخبرنا|حدثني|حدثنى|حدثناه|وحدثناه|وحدثنا|"
+    r"أخبرني|وأخبرنا|وأخبرني|وحدثني|أخبرنيه|أخبر\s|أنبأنا|أنبأني|"
+    r"قرأت|قرئ|أملى|وقرأت|وقرأته|"
+    r"وبهذا|وبإسناده|وبه[\s:]|"
+    r"وذكر|وجدت|سمعت|وسمعت|وعن\s|وفيما|عن\s|وابن|"
+    r"وإن|وأن|وكان|ولقد|وكذا|ثم\s*قال|و\"|"
+    r"وأحسب|وسألته|وأهديت|وقلت|وكتب|وزائدة|"
+    r"وقال[\s:]|قال[\s:]|"
+    r"الحارث|والحارث|"
+    rf"\.(?:\s*\.){{2,}}"
+)
+
+# An editorial bracketed aside can sit between the dash and the real
+# trigger verb — confirmed on real data (167 occurrences in Musnad Ahmad
+# alone, the single largest boundary-miss category found in this whole
+# investigation): either a short attribution "[قال عبد الله بن أحمد]: "
+# before the actual verb (e.g. وجدت), or a bare "[" that wraps the ENTIRE
+# hadith with its closing "]" far away (e.g. "-[حدثنا ..."). Try the
+# short/closed form first; fall back to a bare "[" so the long-wrapping
+# form still matches immediately on the verb that follows it. Kept INSIDE
+# the lookahead (non-consuming), same as the trigger verb itself, so the
+# bracket text is preserved verbatim as part of the new entry's own text —
+# the parser only decides WHERE to split, never rewrites content; stripping
+# presentation artifacts (footnote markers, brackets) is clean_text()'s job
+# at ingestion time, not the parser's.
+_BRACKET_ASIDE = r"(?:\[[^\]\n]{1,80}\][\s:]*|\[)?"
+
+# A footnote-style "(N)" marker can also sit between the dash and the verb
+# (confirmed real, distinct from the footnote markers stripped from body
+# text post-parse — this one interferes with boundary DETECTION itself).
+_FOOTNOTE_ASIDE = rf"(?:\(\s*[{DIGITS}]+\s*\)\s*)?"
+
 HADITH_START_RE = re.compile(
-    rf"([{DIGITS}]+(?:\s*/\s*[{DIGITS}]+)?)\s*-\s*(?=(?:حدثنا|أخبرنا|حدثني|وقال\s|قال\s))"
+    rf"({_SERIAL})\s*-\s*(?={_BRACKET_ASIDE}{_FOOTNOTE_ASIDE}(?:{_TRIGGERS}))"
 )
 
 
