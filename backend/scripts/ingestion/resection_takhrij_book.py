@@ -119,7 +119,11 @@ def main() -> None:
             text_changes.append({"id": hid, "number": number, "old": text, "new": clean_text(e.text)})
     kinds = Counter()
     for c in text_changes:
-        if c["new"] in (c["old"] or "") and len(c["new"]) < len(c["old"] or ""):
+        # page-break word separation (parse_book fix 2026-09-26) only restores
+        # spaces — counted apart so the few substantive changes stay reviewable
+        if re.sub(r"\s", "", c["new"]) == re.sub(r"\s", "", c["old"] or ""):
+            kinds["whitespace only (fused words at page breaks separated)"] += 1
+        elif c["new"] in (c["old"] or "") and len(c["new"]) < len(c["old"] or ""):
             kinds["shortened (glued text removed)"] += 1
         elif (c["old"] or "") in c["new"] and len(c["new"]) > len(c["old"] or ""):
             kinds["lengthened (dropped tail restored)"] += 1

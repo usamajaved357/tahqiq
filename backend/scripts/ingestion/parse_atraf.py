@@ -91,7 +91,7 @@ def _eastern(n: int) -> str:
     return "".join(DIGITS[int(c)] for c in str(n))
 
 
-def parse_entries_sequential(pages: list[dict]) -> tuple[list[dict], list[dict]]:
+def parse_entries_sequential(pages: list[dict], first_serial: int = 1) -> tuple[list[dict], list[dict]]:
     """Find entries by their serial numbers, which run 1, 2, 3… through the
     whole book (2026-09-25 rewrite; parse_entries below is the original).
 
@@ -104,7 +104,8 @@ def parse_entries_sequential(pages: list[dict]) -> tuple[list[dict], list[dict]]
     by a dash, at a line start or after a sentence end — a number inside the
     text ("(١٨ - ٧٦)") is never the next serial at such a position. A title
     span directly after "N -" is that entry's text; any other title span is a
-    companion heading, as before (is_real_companion_title)."""
+    companion heading, as before (is_real_companion_title).
+    first_serial: where a run of pages starts mid-book (regression tests)."""
     headings: list[str] = []
     parts = []
     for page in pages:
@@ -128,7 +129,7 @@ def parse_entries_sequential(pages: list[dict]) -> tuple[list[dict], list[dict]]
     text = "\n".join(parts)
 
     found: dict[int, re.Match] = {}
-    pos, n, last_serial = 0, 1, 0
+    pos, n, last_serial = 0, first_serial, first_serial - 1
     while True:
         best = None
         for k in range(SERIAL_MAX_SKIP + 1):
@@ -143,7 +144,7 @@ def parse_entries_sequential(pages: list[dict]) -> tuple[list[dict], list[dict]]
         pos, n, last_serial = best[1].end(), best[0] + 1, best[0]
     # a header glued to the heading before it ("…عن سهل بن سعد٤٧٠٥ - د حديث"):
     # look again, between its neighbours only, without the line-start condition
-    for s in range(1, last_serial):
+    for s in range(first_serial, last_serial):
         if s in found:
             continue
         lo = max((found[k].end() for k in found if k < s), default=0)
@@ -184,7 +185,7 @@ def parse_entries_sequential(pages: list[dict]) -> tuple[list[dict], list[dict]]
                 "continues_chain": bool(head and re.search(r"و?به$", head.group(0).strip())),
             }
         )
-    missing = [s for s in range(1, last_serial + 1) if s not in found]
+    missing = [s for s in range(first_serial, last_serial + 1) if s not in found]
     return entries, [{"missing_serial": _eastern(s)} for s in missing]
 
 

@@ -368,6 +368,14 @@ def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
         foot = page.get("foot") or ""
         page_id = page["id"]
         titles = TITLE_RE.findall(body)
+        # A page break is a word break: Shamela bodies neither end nor start
+        # with whitespace, so appending the next page directly fused the last
+        # word of one page to the first of the next ("الظلمات" + "إلى" ->
+        # "الظلماتإلى") at 5,879 of Musnad Ahmad's 23,338 page joins
+        # (2026-09-26). Arabic print never splits a word across pages. No
+        # separator before a page that opens with punctuation ("ميت»" + ",").
+        if buffer and not buffer[-1].isspace() and body[:1] and body[0] not in "،,.:؛;)]»!؟?":
+            buffer += "\n"
 
         # Walk the page IN ORDER: text before a title still belongs to the
         # hadith in progress (and may itself start new hadith); each title

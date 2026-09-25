@@ -9,3 +9,4 @@ pydantic-settings
 anthropic
 python-dotenv
 httpx
+pytest

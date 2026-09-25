@@ -43,7 +43,12 @@ config: {"pairs": [original .pairs.json files],
          "derived_clusters": [the .clusters.json written with those pairs],
          "independent_clusters": [other applied .clusters.json files],
          "independent_pairs": [JSON lists whose items start [id_a, id_b, ...]],
-         "protect_reviews": [Tuhfat review .txt files listing "[Collection #N]"]}
+         "protect_reviews": [Tuhfat review .txt files listing "[Collection #N]"],
+         "exclude_pairs": [JSON lists of {"a": [collection, number], "b": [...], "reason": ...}]}
+exclude_pairs: sibling additions read and found WRONG (2026-09-26: 8 of the
+158 sibling additions — mostly one composite hub, Ibn Majah 1326 "من صام
+رمضان وقامه", whose two statements (fasting / night prayer) share almost all
+their words, so text similarity cannot separate them) are never added.
 """
 import itertools
 import json
@@ -140,6 +145,13 @@ def main() -> None:
             protect.add(pair(ia[0], ib[0]))
         else:
             unresolved_protect += 1
+    excluded = set()
+    for path in config.get("exclude_pairs", []):
+        for x in json.load(open(path, encoding="utf-8")):
+            ia, ib = key_to_id.get(tuple(x["a"]), []), key_to_id.get(tuple(x["b"]), [])
+            if len(ia) != 1 or len(ib) != 1:
+                sys.exit(f"exclusion not resolvable to one row each: {x}")
+            excluded.add(pair(ia[0], ib[0]))
     idf, isnad_words, unseen_idf = build_corpus_stats(cited_index)
     scorer = Scorer(idf, isnad_words, unseen_idf, set())
     norm = {i: normalize(t or "") for i, t in text.items()}
@@ -169,7 +181,7 @@ def main() -> None:
         for x in sorted(cited_new.get(s, set()) - {n}):
             sim = sibling_similarity(scorer, norm.get(n, ""), norm.get(x, ""))
             sibling_checks.append((n, x, round(sim, 3)))
-            if sim >= SIBLING_THRESHOLD:
+            if sim >= SIBLING_THRESHOLD and pair(n, x) not in excluded:
                 add.setdefault(pair(n, x), f"sibling via hub {s}, similarity {sim:.2f}")
 
     plan = {
@@ -195,7 +207,7 @@ def main() -> None:
           f"({dict(__import__('collections').Counter(kept.values()))})")
     print(f"additions: {len(add)} (hub {len({s for s, _, _ in changes})} sources; sibling checks {len(sibling_checks)}, "
           f"{sum(1 for *_, v in sibling_checks if v >= SIBLING_THRESHOLD)} >= {SIBLING_THRESHOLD})")
-    print(f"protect pairs resolved: {len(protect)} (unresolved {unresolved_protect})")
+    print(f"protect pairs resolved: {len(protect)} (unresolved {unresolved_protect}); excluded sibling pairs: {len(excluded)}")
     print(f"wrote {out_stem}.json and {out_stem}.review.txt")
 
 
