@@ -79,6 +79,115 @@ def is_real_companion_title(title: str) -> bool:
     return not FAKE_TITLE_RE.search(title) and len(title) < 100
 
 
+SERIAL_MAX_SKIP = 3  # the print skips a few numbers (e.g. 6827, 11051 appear nowhere)
+SERIAL_SEARCH_WINDOW = 60000  # characters ahead in which the next serial must appear
+_ENTRY_HEAD_RE = re.compile(rf"\s*[-–—]\s*({ENTRY_MIDDLE_RE})\s*(?:و?حديث|و?به)")
+_SEGMENT_CODE_RE = re.compile(r"(?:^|(?<=[\s.\-–)\]⦘]))[\[(]?([خمدتسق])[\])]?\s*(?=(?:في|فيه|وفي)\b)")
+_HEADING_MARK = "\x00H{}\x00"
+_HEADING_MARK_RE = re.compile("\x00H(\\d+)\x00")
+
+
+def _eastern(n: int) -> str:
+    return "".join(DIGITS[int(c)] for c in str(n))
+
+
+def parse_entries_sequential(pages: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Find entries by their serial numbers, which run 1, 2, 3… through the
+    whole book (2026-09-25 rewrite; parse_entries below is the original).
+
+    parse_entries missed 2,453 of the 19,626 entries: it removed every title
+    span before looking for "N - … حديث", but Shamela wraps many ENTRIES in a
+    title span ("١٠١٧ -<span data-type="title"> حديث: أنّ النبيَّ ﷺ أعتق
+    صفيَّة…</span>"), and entries continuing the previous chain start "وبه"
+    ("١٤٧٥٠ - وبه فيه (الصلاة ٩٠: ٢) يتعاقبون فيكم ملائكة…"), not "حديث".
+    Here the next header is found as exactly the NEXT expected number followed
+    by a dash, at a line start or after a sentence end — a number inside the
+    text ("(١٨ - ٧٦)") is never the next serial at such a position. A title
+    span directly after "N -" is that entry's text; any other title span is a
+    companion heading, as before (is_real_companion_title)."""
+    headings: list[str] = []
+    parts = []
+    for page in pages:
+        body = page["body"]
+        out, last = [], 0
+        for m in TITLE_RE.finditer(body):
+            out.append(body[last : m.start()])
+            inner = m.group(1)
+            # an entry's own text in a title span follows its "N -" and reads
+            # "حديث…"/"وبه…" or carries citation numbers; a companion heading
+            # can ALSO follow a bare "N -" ("١٤٣٢١ -<span…> محمد بن عبد الرحمن
+            # بن أبي ذئب، عن سعيد المقبري…</span>") and is still a heading
+            if not is_real_companion_title(inner):
+                out.append(" " + inner + " ")
+            else:
+                headings.append(strip_diacritics(inner).strip())
+                out.append("\n" + _HEADING_MARK.format(len(headings) - 1) + "\n")
+            last = m.end()
+        out.append(body[last:])
+        parts.append("".join(out))
+    text = "\n".join(parts)
+
+    found: dict[int, re.Match] = {}
+    pos, n, last_serial = 0, 1, 0
+    while True:
+        best = None
+        for k in range(SERIAL_MAX_SKIP + 1):
+            m = re.compile(rf"(?:^|(?<=[\n.\]\)»\"\x00]))\s*{_eastern(n + k)}(?=\s*[-–—])").search(text, pos, pos + SERIAL_SEARCH_WINDOW)
+            if m and (best is None or m.start() < best[1].start()):
+                best = (n + k, m)
+            if m and k == 0:
+                break
+        if best is None:
+            break
+        found[best[0]] = best[1]
+        pos, n, last_serial = best[1].end(), best[0] + 1, best[0]
+    # a header glued to the heading before it ("…عن سهل بن سعد٤٧٠٥ - د حديث"):
+    # look again, between its neighbours only, without the line-start condition
+    for s in range(1, last_serial):
+        if s in found:
+            continue
+        lo = max((found[k].end() for k in found if k < s), default=0)
+        hi = min((found[k].start() for k in found if k > s), default=len(text))
+        m = re.compile(rf"(?<![{DIGITS}]){_eastern(s)}(?=\s*[-–—]\s*{ENTRY_MIDDLE_RE}\s*(?:و?حديث|و?به))").search(text, lo, hi)
+        if m:
+            found[s] = m
+
+    serials = sorted(found)
+    entries, heading_at = [], None
+    heading_marks = [(m.start(), int(m.group(1))) for m in _HEADING_MARK_RE.finditer(text)]
+    hi_idx = 0
+    for i, s in enumerate(serials):
+        start = found[s].end()
+        end = found[serials[i + 1]].start() if i + 1 < len(serials) else len(text)
+        while hi_idx < len(heading_marks) and heading_marks[hi_idx][0] < found[s].start():
+            heading_at = headings[heading_marks[hi_idx][1]]
+            hi_idx += 1
+        chunk = _HEADING_MARK_RE.sub(" ", text[start:end])
+        head = _ENTRY_HEAD_RE.match(chunk)
+        header_codes = "".join(re.findall(rf"[{CODE_CHARS}]", head.group(1))) if head else ""
+        body = chunk[head.end() :] if head else re.sub(r"^\s*[-–—]", "", chunk)
+        body = re.sub(r"^\s*:?", "", body).strip()
+        citations = [
+            {"code": m.group(1), "book": m.group(2).strip(), "detail": m.group(3).strip()}
+            for m in CITATION_RE.finditer(body)
+        ]
+        cm = CITATION_RE.search(body)
+        codes = header_codes or "".join(sorted({m.group(1) for m in _SEGMENT_CODE_RE.finditer(body)}))
+        entries.append(
+            {
+                "serial": _eastern(s),
+                "codes": codes,
+                "companion": heading_at,
+                "tarf": body[: cm.start()].strip() if cm else body,
+                "citations": citations,
+                "text": body,
+                "continues_chain": bool(head and re.search(r"و?به$", head.group(0).strip())),
+            }
+        )
+    missing = [s for s in range(1, last_serial + 1) if s not in found]
+    return entries, [{"missing_serial": _eastern(s)} for s in missing]
+
+
 def parse_entries(pages: list[dict]) -> tuple[list[dict], list[dict]]:
     """Walk pages in order, tracking the current companion section, and
     accumulating entry text across page boundaries until the next entry (or
@@ -110,6 +219,11 @@ def parse_entries(pages: list[dict]) -> tuple[list[dict], list[dict]]:
                 "companion": pending_entry["companion"],
                 "tarf": tarf,
                 "citations": citations,
+                # the whole entry as printed — the citation parse above misses
+                # "م فيه (…)" ("Muslim, in the same book") segments and keeps
+                # no narrator names; match_atraf_teachers.py reads the
+                # compiler's own teacher ("عن X") from this raw text
+                "text": text,
             }
         )
 
@@ -182,14 +296,14 @@ def main() -> None:
             pages.append(json.loads(line))
     print(f"loaded {len(pages)} pages")
 
-    entries, unparsed_log = parse_entries(pages)
+    entries, unparsed_log = parse_entries_sequential(pages)
 
-    multi_collection = [e for e in entries if len({c["code"] for c in e["citations"]}) >= 2]
+    multi_collection = [e for e in entries if len(set(e["codes"]) & set("خمدتسق")) >= 2]
 
     print(f"parsed {len(entries)} entries total")
-    print(f"entries citing 2+ distinct collections: {len(multi_collection)}")
+    print(f"entries citing 2+ of the six books: {len(multi_collection)}")
     print(f"entries with zero citations found: {sum(1 for e in entries if not e['citations'])}")
-    print(f"orphaned/unparsed pages logged: {len(unparsed_log)}")
+    print(f"serials not found in the text: {[x['missing_serial'] for x in unparsed_log]}")
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"entries": entries, "unparsed_log": unparsed_log}, f, ensure_ascii=False, indent=1)

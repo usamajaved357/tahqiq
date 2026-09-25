@@ -11,7 +11,10 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # within free storage limits — see project notes on the two-database split.
 # Same declarative Base/metadata is shared across both; only hadith_* tables
 # are ever created/queried through HadithSessionLocal.
-hadith_engine = create_engine(settings.HADITH_DATABASE_URL)
+# pool_pre_ping: Neon closes idle connections server-side; without it, the
+# first query after a long idle stretch fails with "SSL connection has been
+# closed unexpectedly" on a stale pooled connection.
+hadith_engine = create_engine(settings.HADITH_DATABASE_URL, pool_pre_ping=True)
 HadithSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=hadith_engine)
 
 

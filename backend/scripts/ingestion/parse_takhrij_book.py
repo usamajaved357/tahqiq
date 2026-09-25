@@ -331,26 +331,16 @@ def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
         pending.page_ids = list(buffer_pages)
         entries.append(pending)
 
-    for page in pages:
-        body = page.get("body") or ""
-        foot = page.get("foot") or ""
-        page_id = page["id"]
-
-        titles = TITLE_RE.findall(body)
-        remaining = TITLE_RE.sub("\n", body)
-
-        if titles:
-            finalize()
-            pending = None
-            buffer, buffer_pages = "", []
-            current_heading = strip_with_map(titles[-1])[0].strip()
-
-        stripped, idx_map = strip_with_map(remaining)
+    def consume(segment: str, page_id: str) -> None:
+        """Split one stretch of page text (containing no titles) at every
+        numbered hadith start, extending the hadith in progress first."""
+        nonlocal pending, buffer, buffer_pages
+        stripped, idx_map = strip_with_map(segment)
         pos = 0
         for m in HADITH_START_RE.finditer(stripped):
-            orig_start = idx_map[m.start()] if m.start() < len(idx_map) else len(remaining)
-            orig_end = idx_map[m.end() - 1] + 1 if m.end() - 1 < len(idx_map) else len(remaining)
-            chunk = remaining[pos:orig_start]
+            orig_start = idx_map[m.start()] if m.start() < len(idx_map) else len(segment)
+            orig_end = idx_map[m.end() - 1] + 1 if m.end() - 1 < len(idx_map) else len(segment)
+            chunk = segment[pos:orig_start]
             buffer += chunk
             buffer_pages.append(page_id)
             if pending is not None:
@@ -363,7 +353,7 @@ def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
             buffer, buffer_pages = "", []
             pos = orig_end
 
-        tail_chunk = remaining[pos:]
+        tail_chunk = segment[pos:]
         buffer += tail_chunk
         if page_id not in buffer_pages:
             buffer_pages.append(page_id)
@@ -372,9 +362,32 @@ def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
             marker_counts[id(pending)] = marker_counts.get(id(pending), 0) + len(
                 _INLINE_MARKER_RE.findall(tail_chunk)
             )
+
+    for page in pages:
+        body = page.get("body") or ""
+        foot = page.get("foot") or ""
+        page_id = page["id"]
+        titles = TITLE_RE.findall(body)
+
+        # Walk the page IN ORDER: text before a title still belongs to the
+        # hadith in progress (and may itself start new hadith); each title
+        # then closes the current hadith and starts a new section at exactly
+        # that point. The earlier version finalized at the page's first title
+        # BEFORE reading the text ahead of it (silently dropping the tails of
+        # ~10 Musnad Ahmad hadith and 1 in Sunan al-Kubra), and gave every
+        # hadith on a multi-title page the page's LAST title (found 2026-09-24).
+        pos = 0
+        for tm in TITLE_RE.finditer(body):
+            consume(body[pos : tm.start()], page_id)
+            finalize()
+            pending = None
+            buffer, buffer_pages = "", []
+            current_heading = strip_with_map(tm.group(1))[0].strip()
+            pos = tm.end()
+        consume(body[pos:], page_id)
         assembler.consume_page_foot(foot)
 
-        if pending is None and not titles and remaining.strip() and not buffer.strip():
+        if pending is None and not titles and body.strip() and not buffer.strip():
             unparsed_log.append({"id": page_id, "reason": "no heading/hadith context yet"})
 
     finalize()
@@ -389,6 +402,117 @@ def load_pages(path: str) -> list[dict]:
     return pages
 
 
+_DIACRITICS_RE = re.compile(r"[\u064B-\u0652\u0670]")
+_PAGE_HADITH_START_RE = re.compile(r"[٠-٩]+\s*[-–—]\s")
+# A volume's front matter, reprinted at the start of every printed volume:
+# the title page, the manuscripts used, the edition's symbols, statistics,
+# and al-Sindi's biography of the companion. None of it is hadith text.
+_FRONT_MATTER_RE = re.compile(
+    r"مسند\s*الإمام\s*[اأ]حمد(?:\s*(?:بن|ابن)\s*حنبل)?\s*\(?\s*١٦٤|النسخ الخطية المعتمدة|اعتمدنا في تحقيق|"
+    r"اعتمد في تحقيق هذا الجزء|الرموز المستعملة|عدد الأحاديث الصحيحة|بقلم\s*:?\s*السندي|حقق هذا الجزء|"
+    r"الموسوعة الحديثية|المشرف العام|^\s*﷽?\s*استدراك|^\s*﷽\s*$|^\s*﷽?\s*مقدمة التحقيق|^\s*﷽?\s*ترجمة\s"
+)
+# An editor's label printed just before a title: "[سادس عشر الأنصار]"
+# (or the first word of a heading left outside its tag: "أول<span …>مسند الكوفيين")
+# (or a surah number before al-Kubra's Tafsir heading: "٧٩ -<span …>سورة النازعات")
+_LABEL_BEFORE_TITLE_RE = re.compile(r"^\s*(?:\[[^\]<]{2,40}\]|أول|تتمة|[٠-٩]+\s*[-–—])\s*(?=<span data-type)")
+# "تتمة مسند أبي هريرة" — a reminder printed at the start of a volume that
+# continues the previous volume's musnad; not a new section, not hadith text.
+_CONTINUATION_NOTE_RE = re.compile(r"^\s*﷽?\s*تتمة\s+(?:مسند|حديث)\s[^٠-٩<]{2,80}?(?=[٠-٩]+\s*[-–—]\s)")
+_AHMAD_DATES_RE = re.compile(r"\(?\s*١٦٤\s*[-–—ـ]\s*٢٤١\s*هـ?\s*\)?")
+# A section heading printed as plain text (not wrapped as a Shamela title):
+# "مسند علي بن أبي طالب (١) ﵁", "حديث عقيل بن أبي طالب", "ومن مسند بني هاشم…"
+_PLAIN_HEADING_RE = re.compile(
+    r"^\s*((?:و?من |بقية |تمام |ومن )?(?:مسند|حديث|أحاديث)\s[^<]{2,200}?)\s*(?=(?:[٠-٩]+\s*[-–—]\s)|$)"
+)
+# The editors' end-of-section notes ("آخر مسند أبي هريرة ﵁", "هذا آخر مسند
+# البصريين") — editorial, not hadith text.
+_END_MARKER_RE = re.compile(r"(?:\[\s*آخر\s+(?:مسند|أحاديث|حديث)\s[^<\]]{2,80}\]|(?:هذا\s+)?آخر\s+(?:مسند|أحاديث|حديث)\s[^.<\]،]{2,80})\s*\.?\s*$")
+
+
+def prepare_pages(pages: list[dict]) -> list[dict]:
+    """Normalize a raw Shamela page export before parse_book() (2026-09-24).
+
+    1. True page order: the Musnad Ahmad export is stored as 5 out-of-order
+       segments, and parse_book() reads in list order.
+    2. Volume front matter is dropped — previously glued onto the last
+       hadith of each volume (44 Musnad hadith).
+    3. Section headings printed as plain text — whole heading pages, or a
+       heading line at the very start of a page — become title markup. The
+       Shamela export (and its own table of contents) has no title for most
+       of the largest musnads ('Ali, Ibn 'Abbas, Ibn 'Umar, Abu Hurayra,
+       Anas, Jabir …); the headings exist only as plain text, which the
+       parser glued onto the previous hadith instead of starting a section.
+    4. Editorial end-of-section notes are removed from the end of a page.
+    Only page-INITIAL headings are converted: a title mid-page would cut the
+    previous hadith's tail from it (see parse_book)."""
+    out = []
+    in_front_matter = False
+    for page in sorted(pages, key=lambda p: int(p["id"].split("-")[1])):
+        body = page.get("body") or ""
+        label = _LABEL_BEFORE_TITLE_RE.match(_DIACRITICS_RE.sub("", body))  # the raw text is vowelled
+        if label:
+            body = body[_find_original_offset(body, label.end()) :]
+        plain = _DIACRITICS_RE.sub("", TITLE_RE.sub(r"\1", body))
+        # Imam Ahmad's dates on every volume title page, "(١٦٤ - ٢٤١ هـ)",
+        # look exactly like "hadith #164 starts here" to a number-dash test
+        # the parser's own hadith-start rule (number + dash + a transmission
+        # verb), not a bare "number - ": front matter lists manuscripts as
+        # "١ - نسخة المكتبة الظاهرية", which a bare test mistook for hadith
+        has_hadith = bool(HADITH_START_RE.search(strip_with_map(_AHMAD_DATES_RE.sub(" ", plain))[0]))
+        # only on untagged pages: with title tags present the parser already
+        # treats "تتمة …" as a (zero-hadith) heading, and plain-text offsets
+        # would not map onto the tagged body
+        cont = None if TITLE_RE.search(body) else _CONTINUATION_NOTE_RE.match(plain)
+        if cont:
+            body = body[_find_original_offset(body, cont.end()) :]
+            plain = plain[cont.end() :]
+        # Front matter can run over several pages (an editor's introduction
+        # to Abu Hurayra's musnad, al-Sindi's biography of Anas …) and only
+        # the first page carries a recognizable marker: once in it, drop
+        # every page until the first real hadith or heading. Volumes end on
+        # a hadith boundary, so nothing of a hadith can be in between.
+        if not has_hadith and _FRONT_MATTER_RE.search(plain):
+            # a volume title page also LOOKS like a heading ("مسند الإمام
+            # أحمد …"), so it must be dropped before the heading test below
+            in_front_matter = True
+            out.append({**page, "body": ""})
+            continue
+        starts_section = bool(TITLE_RE.search(body)) or bool(_PLAIN_HEADING_RE.match(plain)) or bool(cont)
+        if in_front_matter:
+            if has_hadith or starts_section:
+                in_front_matter = False
+            else:
+                out.append({**page, "body": ""})
+                continue
+        if not TITLE_RE.search(body) and not has_hadith and len(plain.strip()) < 250:
+            m = _PLAIN_HEADING_RE.match(plain)
+            if m and "حدثنا" not in plain and "قال" not in plain and '"' not in plain:
+                out.append({**page, "body": f"<span data-type='title'>{body.strip()}</span>"})
+                continue
+        if not TITLE_RE.match(body.strip()):
+            m = _PLAIN_HEADING_RE.match(plain)
+            if m and _PAGE_HADITH_START_RE.search(plain[m.end() : m.end() + 12]):
+                cut = _find_original_offset(body, m.end())
+                body = f"<span data-type='title'>{body[:cut].strip()}</span>{body[cut:]}"
+        end = _END_MARKER_RE.search(_DIACRITICS_RE.sub("", body))
+        if end:
+            body = body[: _find_original_offset(body, end.start())]
+        out.append({**page, "body": body})
+    return out
+
+
+def _find_original_offset(original: str, plain_offset: int) -> int:
+    """Map an offset in the diacritics-stripped text back to the original."""
+    seen = 0
+    for i, ch in enumerate(original):
+        if seen == plain_offset:
+            return i
+        if not _DIACRITICS_RE.match(ch):
+            seen += 1
+    return len(original)
+
+
 def main() -> None:
     if len(sys.argv) != 3:
         print(__doc__)
@@ -396,7 +520,7 @@ def main() -> None:
     in_path, out_path = sys.argv[1], sys.argv[2]
     pages = load_pages(in_path)
     print(f"loaded {len(pages)} pages")
-    entries, unparsed = parse_book(pages)
+    entries, unparsed = parse_book(prepare_pages(pages))
     print(f"parsed {len(entries)} hadith entries")
     print(f"unparsed/orphaned pages: {len(unparsed)}")
     with open(out_path, "w", encoding="utf-8") as f:

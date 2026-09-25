@@ -1,6 +1,7 @@
 """Extracts "same hadith" cross-reference citations from a takhrij-style
-edition's raw footnote text (currently: Musnad Ahmad only — see
-docs/HADITH_CROSS_REFERENCING.md for why Sunan al-Kubra has none).
+edition's raw footnote text — any of the Arna'ut/Risala editions (Musnad
+Ahmad, Sunan Abu Dawud, Jami' Tirmidhi, Sunan Ibn Majah, Sunan an-Nasa'i);
+see docs/HADITH_CROSS_REFERENCING.md for why Sunan al-Kubra has none.
 
 Deliberately does NOT trust per-hadith footnote attribution (parse_takhrij_
 book.py's own _FootnoteAssembler was found, empirically, to accumulate
@@ -11,15 +12,17 @@ citation belong to" as a separate, content-verified step in
 match_citations.py — the same "never trust position, verify by content"
 discipline already used for Tuhfat al-Ashraf.
 
-Only the single clearest, safest signal is extracted: a citation phrase
-ending in "بهذا الإسناد" ("with this [same] isnad") or "بهذا الحديث" ("with
-this [same] hadith") — confirmed, per docs/HADITH_CROSS_REFERENCING.md
-Section 5, to unambiguously mean "same hadith, safe to link." Everything
-else (شاهد/corroborating-witness citations, "سلف برقم" self-references to a
-DIFFERENT companion, "وفي الباب عن" topic cross-references) names a
-DIFFERENT hadith and is deliberately NOT extracted here — building that
-classifier is separate, even-higher-stakes work, not a "few more patterns"
-extension of this one.
+Only "same hadith" signals are extracted (kind):
+  - "same_isnad": an "أخرجه ..." span closed by "بهذا الإسناد", "بهذا
+    الحديث" or the editors' short form "، به" ("with it", i.e. with this
+    same isnad) — every book named inside the span is claimed as the same
+    isnad, not just the first.
+  - "is_in": the editors' explicit statement that THIS hadith is found at a
+    given number elsewhere — 'وهو في "مسند أحمد" (N)' (Sunan editions) and
+    'وهو في "السنن الكبرى" برقم (N)' (Nasa'i's Mujtaba edition).
+Everything else (شاهد/corroborating-witness citations, "سلف برقم" self-
+references, "وفي الباب عن" topic cross-references) names a DIFFERENT hadith
+and is deliberately NOT extracted here.
 
 Usage: python -m scripts.ingestion.extract_citations <raw_pages.jsonl> <out.json>
 """
@@ -29,59 +32,79 @@ import sys
 
 DIGITS = "٠١٢٣٤٥٦٧٨٩"
 
-# One "أخرجه ... بهذا الإسناد/الحديث" span can name several collections
-# before its closing phrase (e.g. "وأخرجه البخاري (٧٢٢٢)، والبيهقي في
-# 'الدلائل' ٦/ ٥١٩، والبغوي (٤٢٣٧) من طريق محمد بن جعفر، بهذا الإسناد") —
-# every one of those named collections is being claimed as the same isnad,
-# not just the first. Bounded to 350 chars to avoid a runaway match if a
-# page happens to lack the closing phrase within a reasonable distance.
-SPAN_RE = re.compile(r"(?:و)?أخرجه(.{5,350}?)(?:بهذا الإسناد|بهذا الحديث)")
+# Bounded to 350 chars to avoid a runaway match if a page happens to lack the
+# closing phrase within a reasonable distance. "، به" must be followed by
+# punctuation/space so words merely starting with "به" (بهز …) don't close
+# a span.
+SPAN_RE = re.compile(r"(?:و)?أخرجه(.{5,350}?)(?:بهذا الإسناد|بهذا الحديث|،\s*به(?=[.،:؛\s]))")
 
-# A citation within a span names a collection then a parenthesized number,
-# e.g. "البخاري (٧٢٢٢)" — sometimes with an in-parens sub-reference like
-# "مسلم (٢١٤) (٣٦٥)" (book/hadith-number pair, both kept as the full number
-# string; see docs' note on Muslim's numbering variability). A name can also
-# appear with NO number at all (e.g. "والطبري ٢٤/ ٢٧", a volume/page
-# reference, not a hadith number) — those are skipped, not guessed at.
-CITATION_RE = re.compile(rf"([^\d\(\.,،؛]{{1,30}}?)\s*((?:\(\s*[{DIGITS}]+\s*\)\s*){{1,2}})")
+# One or two parenthesized numbers: "(٧٢٢٢)", Muslim's "(٢١٤) (٣٦٥)" /
+# "(١٨٩٥): (١٣٥)" (Abd al-Baqi global number first).
+NUMBERS_RE = re.compile(rf"\(\s*([{DIGITS}]+)\s*\)(?:\s*:?\s*\(\s*([{DIGITS}]+)\s*\))?")
 
-# Maps a citation's own name text to our HadithCollection.name — every
-# variant actually observed in real Musnad Ahmad footnotes (see the name
-# frequency table gathered during investigation). Deliberately EXCLUDES
-# name-alike sources that are a DIFFERENT book, not the collection we mean:
-# "البخاري في الأدب المفرد" is Bukhari's separate work, not Sahih al-
-# Bukhari; "النسائي في الكبرى" is the Sunan al-Kubra already ingested
-# separately (its own collection, with no footnotes of its own — see
-# Section 4b) — citations INTO it from Musnad Ahmad are legitimate future
-# work but are not resolved by this script (the "Sunan an-Nasa'i" row in
-# our DB is the STANDARD Mujtaba recension only).
-COLLECTION_NAME_MAP: dict[str, str] = {
+# A citation is a known book name IMMEDIATELY to the left of its number,
+# optionally qualified by which of the author's works is meant. Anchoring on
+# the number and matching leftwards is deliberate: a first version matched
+# up to 30 characters rightwards from wherever the scan happened to start,
+# so "وأخرجه من طريق يحيى بن سعيد البخاري (٥٥٨١)" produced the "name"
+# "ن طريق يحيى بن سعيد البخاري" — unmapped, silently dropped.
+NAME_BEFORE_NUMBER_RE = re.compile(
+    r'(?:^|[\s،,.؛:)])و?(البخاري|مسلم|أبو داود|الترمذي|ابن ماجه|النسائي|أحمد)'
+    r'(?:\s+في\s*"([^"]{1,25})")?\s*$'
+)
+NARRATOR_NAME_PREFIXES = {"أبو", "أبي", "أبا", "بن", "ابن", "عن", "حدثنا", "أخبرنا"}
+BASE_COLLECTION = {
     "البخاري": "Sahih al-Bukhari",
     "مسلم": "Sahih Muslim",
     "أبو داود": "Sunan Abu Dawud",
     "الترمذي": "Jami At-Tirmidhi",
     "ابن ماجه": "Sunan Ibn Majah",
     "النسائي": "Sunan an-Nasa'i",
-    "النسائي في المجتبى": "Sunan an-Nasa'i",
+    "أحمد": "Musnad Ahmad",
 }
-# Names that look like a match but must resolve to nothing (checked against
-# real occurrences, not assumed):
-EXCLUDED_NAME_HINTS = (
-    "الأدب المفرد",
-    "في الكبرى",  # Nasa'i's Kubra — different collection, see docstring
-    "الأوسط",
-    "الصغرى",  # Bayhaqi/Tabarani's separate works, not a Nasa'i-Kubra alias
-)
+# A qualifier names WHICH of the author's works is cited. Only these map to
+# a collection we hold; any other qualifier ("الأدب المفرد", "التاريخ الكبير",
+# "خلق أفعال العباد", "عمل اليوم والليلة" …) is a different book and the
+# citation is dropped rather than guessed at.
+QUALIFIED_COLLECTION = {
+    ("أحمد", "مسنده"): "Musnad Ahmad",
+    ("النسائي", "الكبرى"): "Sunan al-Kubra",
+    ("النسائي", "المجتبى"): "Sunan an-Nasa'i",
+}
+
+IS_IN_PATTERNS = [
+    (re.compile(rf'وهو في\s*"مسند أحمد"\s*((?:\(\s*[{DIGITS}]+\s*\)\s*(?:و\s*)?)+)'), "Musnad Ahmad"),
+    (re.compile(rf'وهو في\s*"السنن الكبرى"\s*برقم\s*((?:\(\s*[{DIGITS}]+\s*\)\s*(?:و\s*)?)+)'), "Sunan al-Kubra"),
+]
 
 
-def resolve_collection(raw_name: str, following_context: str) -> str | None:
-    name = raw_name.strip().strip("و")
-    if any(h in following_context[:20] for h in EXCLUDED_NAME_HINTS):
-        return None
-    return COLLECTION_NAME_MAP.get(name)
+def resolve_collection(name: str, qualifier: str | None) -> str | None:
+    if qualifier is None:
+        return BASE_COLLECTION.get(name)
+    return QUALIFIED_COLLECTION.get((name, qualifier.strip()))
+
+
+# A page's footnote area holds several hadith's notes back to back. A span
+# must not cross from one note into the next — confirmed real: "أخرجه أحمد
+# (…)… وهذا الإسناد غير محفوظ.(¬٢) إسناده حسن… بهذا الحديث" read the first
+# note's non-matching citations as if the second note's closing phrase
+# covered them. "(¬N)" always starts a note; a plain "(N)" only right after
+# a sentence end (Muslim's "(٣٠) (٤٨)" sub-numbers never follow a period).
+NOTE_BOUNDARY_RE = re.compile(rf"\(¬[{DIGITS}]{{1,3}}\)|(?<=\.)\s*\([{DIGITS}]{{1,2}}\)")
+
+
+def split_notes(foot: str) -> list[str]:
+    return [seg for seg in NOTE_BOUNDARY_RE.split(foot) if seg.strip()]
 
 
 def extract_page_citations(page_id: str, foot: str) -> list[dict]:
+    results = []
+    for note in split_notes(foot):
+        results.extend(_extract_note_citations(page_id, note))
+    return results
+
+
+def _extract_note_citations(page_id: str, foot: str) -> list[dict]:
     results = []
     for span_m in SPAN_RE.finditer(foot):
         span_text = span_m.group(0)
@@ -91,14 +114,23 @@ def extract_page_citations(page_id: str, foot: str) -> list[dict]:
         via_m = re.search(r"من\s+طريق(?:ين)?\s+([^.،؛]{1,60})", inner)
         via_hint = via_m.group(1).strip() if via_m else None
 
-        for cite_m in CITATION_RE.finditer(inner):
-            name_raw, numbers_raw = cite_m.group(1), cite_m.group(2)
-            collection = resolve_collection(name_raw, inner[cite_m.end(1) :])
+        last_collection, last_end = None, -1
+        for num_m in NUMBERS_RE.finditer(inner):
+            window = inner[max(0, num_m.start() - 45) : num_m.start()]
+            name_m = NAME_BEFORE_NUMBER_RE.search(window)
+            collection = None
+            if name_m:
+                # "أبو أحمد", "محمد بن أحمد", "عن مسلم" — a narrator, not the book
+                preceding = window[: name_m.start(1)].split()
+                if not (preceding and preceding[-1] in NARRATOR_NAME_PREFIXES):
+                    collection = resolve_collection(name_m.group(1), name_m.group(2))
+            elif last_collection and re.fullmatch(r"\s*و\s*", inner[last_end : num_m.start()]):
+                # "أحمد (١٩٣٥٩) و (١٩٣٦٦)" — a further number of the same book
+                collection = last_collection
+            last_collection, last_end = collection, num_m.end()
             if not collection:
                 continue
-            numbers = re.findall(rf"[{DIGITS}]+", numbers_raw)
-            if not numbers:
-                continue
+            numbers = [n for n in num_m.groups() if n]
             results.append(
                 {
                     "page_id": page_id,
@@ -106,8 +138,23 @@ def extract_page_citations(page_id: str, foot: str) -> list[dict]:
                     "numbers": numbers,
                     "via_hint": via_hint,
                     "span_text": span_text.strip(),
+                    "kind": "same_isnad",
                 }
             )
+
+    for pattern, collection in IS_IN_PATTERNS:
+        for m in pattern.finditer(foot):
+            for number in re.findall(rf"[{DIGITS}]+", m.group(1)):
+                results.append(
+                    {
+                        "page_id": page_id,
+                        "collection": collection,
+                        "numbers": [number],
+                        "via_hint": None,
+                        "span_text": m.group(0).strip(),
+                        "kind": "is_in",
+                    }
+                )
     return results
 
 
@@ -126,12 +173,13 @@ def main() -> None:
                 continue
             citations.extend(extract_page_citations(page["id"], foot))
 
-    print(f"extracted {len(citations)} same-isnad citations into our six collections")
-    by_collection: dict[str, int] = {}
+    print(f"extracted {len(citations)} same-hadith citations into collections we hold")
+    by_collection: dict[tuple[str, str], int] = {}
     for c in citations:
-        by_collection[c["collection"]] = by_collection.get(c["collection"], 0) + 1
-    for name, count in sorted(by_collection.items(), key=lambda x: -x[1]):
-        print(f"  {count:6d}  {name}")
+        key = (c["collection"], c["kind"])
+        by_collection[key] = by_collection.get(key, 0) + 1
+    for (name, kind), count in sorted(by_collection.items(), key=lambda x: -x[1]):
+        print(f"  {count:6d}  {name}  ({kind})")
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(citations, f, ensure_ascii=False, indent=1)

@@ -91,36 +91,33 @@ def main() -> None:
         )
         session.commit()
 
-        # Assign book_number as a running counter over distinct headings, in
-        # a STABLE sort of the distinct heading strings, not first-seen
-        # encounter order. HadithBook's unique key is (collection_id,
-        # book_number), not the heading text — so book_number is what
-        # upsert_one actually matches an existing row by. Encounter order
-        # depends on how many entries happen to fall under each heading,
-        # which is NOT guaranteed to stay identical between two runs of the
-        # parser (confirmed on real data: a re-run after fixing an unrelated
-        # boundary bug changed the entries-per-heading distribution enough
-        # to shift which heading landed on which book_number). That silently
-        # relabeled existing book rows to a DIFFERENT heading on the second
-        # run, which orphaned the first run's hadith rows under a book_id
-        # that no longer meant what it did when they were written — a
-        # confirmed 36,182-row corruption this sort-based numbering fixes by
-        # making book_number depend only on the SET of headings, never on
-        # the order or count of entries under them.
-        book_id_by_heading: dict[str, int] = {}
-        distinct_headings = sorted({e["heading"] or "(no heading)" for e in entries})
-        book_rows_needed: dict[str, int] = {h: i + 1 for i, h in enumerate(distinct_headings)}
+        # One section per RUN of consecutive entries under the same heading,
+        # numbered in page order (2026-09-24). The previous scheme — one book
+        # per DISTINCT heading text, numbered by sorting the set of headings —
+        # merged every repeated heading ("حديث رجل", "نوع آخر", "باب" …) across
+        # the whole book into a single section. Its stated reason (book_number
+        # stable across re-runs even if the parse shifts) still holds here:
+        # the run sequence depends only on the parse, and a re-ingest of an
+        # existing collection should go through resection_takhrij_book.py,
+        # which corrects rows in place instead of upserting by book_number.
+        run_index: list[int] = []
+        run_headings: list[str] = []
+        for e in entries:
+            heading = e["heading"] or "(no heading)"
+            if not run_headings or run_headings[-1] != heading:
+                run_headings.append(heading)
+            run_index.append(len(run_headings) - 1)
 
-        for heading, number in book_rows_needed.items():
-            book_id = upsert_one(
+        book_id_by_run: dict[int, int] = {}
+        for i, heading in enumerate(run_headings):
+            book_id_by_run[i] = upsert_one(
                 session,
                 HadithBook,
-                {"collection_id": collection_id, "book_number": number, "name_ar": heading},
+                {"collection_id": collection_id, "book_number": i + 1, "name_ar": heading},
                 index_elements=["collection_id", "book_number"],
             )
-            book_id_by_heading[heading] = book_id
         session.commit()
-        print(f"  {len(book_id_by_heading)} book/chapter sections")
+        print(f"  {len(book_id_by_run)} book/chapter sections")
 
         # (book_id, hadith_number) is our uniqueness key, but a handful of
         # real cases exist where the SAME printed number covers two
@@ -133,26 +130,25 @@ def main() -> None:
         # lose real hadith text, which "no mistake is bearable" rules out.
         # Disambiguating with a "-2", "-3" suffix keeps both, still
         # traceable back to the edition's own printed number.
-        seen_key_counts: dict[tuple[str, str], int] = {}
+        seen_key_counts: dict[tuple[int, str], int] = {}
         disambiguated = 0
 
         hadith_rows = []
         skipped_empty = 0
-        for e in entries:
+        for e, run in zip(entries, run_index):
             text = clean_text(e["text"])
             if not text:
                 skipped_empty += 1
                 continue
-            heading = e["heading"] or "(no heading)"
             serial = e["serial"]
-            key = (heading, serial)
+            key = (run, serial)
             seen_key_counts[key] = seen_key_counts.get(key, 0) + 1
             if seen_key_counts[key] > 1:
                 serial = f"{serial}-{seen_key_counts[key]}"
                 disambiguated += 1
             hadith_rows.append(
                 {
-                    "book_id": book_id_by_heading[heading],
+                    "book_id": book_id_by_run[run],
                     "hadith_number": serial,
                     "text_ar": text,
                     "source_dataset": source_tag,
