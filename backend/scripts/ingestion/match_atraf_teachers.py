@@ -109,7 +109,7 @@ def main() -> None:
 
     rows: dict[str, list[tuple[int, str, list[str]]]] = {}
     inverted: dict[str, dict[str, set[int]]] = {}
-    for coll in {c for cs in CODE_COLLECTIONS.values() for c in cs}:
+    for coll in sorted({c for cs in CODE_COLLECTIONS.values() for c in cs}):
         rows[coll] = []
         inverted[coll] = {}
         for rs in number_index[coll].values():
@@ -146,10 +146,13 @@ def main() -> None:
             best = []
             for coll in CODE_COLLECTIONS[code]:
                 votes = Counter(i for w in tarf if scorer._weight(w) > 5.0 for i in inverted[coll].get(w, ()))
-                for w in set(chain):
+                for w in sorted(set(chain)):
                     for i in inverted[coll].get(w, ()):
                         votes[i] += 1
-                for i, _ in votes.most_common(60):
+                # ties broken by row, not by set order: Python orders a set of
+                # strings differently on every run, which made the 60-row cut —
+                # and so a few edge matches — change between runs (2026-09-26)
+                for i, _ in sorted(votes.items(), key=lambda x: (-x[1], x[0]))[:60]:
                     hid, norm, words = rows[coll][i]
                     head = set(words[:TEACHER_HEAD_WORDS])
                     # at least half of a teacher's distinctive name words — the

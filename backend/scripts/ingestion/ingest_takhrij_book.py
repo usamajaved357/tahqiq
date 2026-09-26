@@ -33,25 +33,29 @@ from scripts.ingestion.common import hadith_db_session, upsert_many, upsert_many
 FOOTNOTE_MARKER_RE = re.compile(r"\(\s*¬?[٠-٩]+\s*\)")
 BULLET_MARKER_RE = re.compile(r"•")
 
-# Ordered so a more specific phrase ("صحيح لغيره") is checked before the
-# plainer one it contains ("صحيح") would otherwise also match.
-GRADE_PATTERNS: list[tuple[str, str]] = [
-    (r"إسناده\s+صحيح\s+على\s+شرط\s+الشيخين", "sahih"),
-    (r"إسناده\s+صحيح\s+على\s+شرط\s+مسلم", "sahih"),
-    (r"إسناده\s+صحيح\s+على\s+شرط\s+البخاري", "sahih"),
-    (r"حديث\s+صحيح\s+لغيره", "sahih li-ghayrihi"),
-    (r"إسناده\s+صحيح\s+لغيره", "sahih li-ghayrihi"),
-    (r"حديث\s+حسن\s+لغيره", "hasan li-ghayrihi"),
-    (r"إسناده\s+حسن\s+لغيره", "hasan li-ghayrihi"),
-    (r"إسناده\s+صحيح", "sahih"),
-    (r"حديث\s+صحيح", "sahih"),
+# Al-Arna'ut opens every note that judges a hadith with the verdict: "إسناده
+# صحيح على شرط الشيخين…", "حديث صحيح", "صحيح لغيره، وهذا إسناد ضعيف…",
+# "إسناده ضعيف لضعف…" (openings counted over all Musnad Ahmad notes,
+# 2026-09-26). Only a note's OPENING is read: further in, the notes discuss
+# other routes ("…من طريق صالح المري… وإسناده ضعيف") and other hadith, which
+# searching the whole footnote picked up (#19804 "صحيح لغيره" read as da'if).
+# Ordered so "صحيح لغيره" wins over "صحيح". Not mapped (no grade rather than
+# a guess): "إسناده قوي" / "إسناده جيد" (between hasan and sahih in his usage),
+# "رجاله ثقات…" (no verdict), "إسناده محتمل للتحسين".
+GRADE_OPENINGS: list[tuple[str, str]] = [
+    (r"(?:حديث\s+|مرفوعه\s+)?صحيح\s+لغيره", "sahih li-ghayrihi"),
+    (r"(?:حديث\s+|مرفوعه\s+)?حسن\s+لغيره", "hasan li-ghayrihi"),
+    (r"(?:إسناده|إسناداه)\s+صحيح", "sahih"),
+    (r"(?:حديث\s+)?صحيح(?![ء-ي])", "sahih"),
     (r"إسناده\s+حسن", "hasan"),
-    (r"حديث\s+حسن", "hasan"),
+    (r"(?:حديث\s+)?حسن(?![ء-ي])", "hasan"),
     (r"إسناده\s+ضعيف", "da'if"),
-    (r"حديث\s+ضعيف", "da'if"),
+    (r"(?:حديث\s+)?ضعيف(?![ء-ي])", "da'if"),
 ]
-GRADE_RE = re.compile("|".join(f"(?P<g{i}>{p})" for i, (p, _) in enumerate(GRADE_PATTERNS)))
-GRADE_BY_GROUP = {f"g{i}": grade for i, (_, grade) in enumerate(GRADE_PATTERNS)}
+GRADE_OPENING_RE = re.compile("|".join(f"(?P<g{i}>{p})" for i, (p, _) in enumerate(GRADE_OPENINGS)))
+GRADE_BY_GROUP = {f"g{i}": grade for i, (_, grade) in enumerate(GRADE_OPENINGS)}
+_NOTE_SPLIT_RE = re.compile(r"(?:^|(?<=\S))\(\s*¬?\s*[٠-٩]+\s*\)\s*")
+_DIACRITICS_RE = re.compile(r"[ً-ْٰ]")
 
 
 def clean_text(text: str) -> str:
@@ -61,14 +65,14 @@ def clean_text(text: str) -> str:
 
 
 def extract_grade(footnote_text: str) -> str | None:
-    """Takes the FIRST explicit grading statement in the footnote — Al-Arna'ut's
-    convention is to open a hadith's footnote with its grading before any
-    cross-reference citations, so the first match is reliably the grade for
-    THIS hadith, not a later hadith's grade bleeding in from a shared page."""
-    m = GRADE_RE.search(footnote_text)
-    if not m:
-        return None
-    return GRADE_BY_GROUP[m.lastgroup]
+    """The verdict at the opening of the first of this hadith's own notes
+    that opens with one (notes on a word or a manuscript reading come first
+    as often as not: "(١) في (م): …(٢) إسناده صحيح…")."""
+    for note in _NOTE_SPLIT_RE.split(footnote_text or ""):
+        m = GRADE_OPENING_RE.match(_DIACRITICS_RE.sub("", note).strip())
+        if m:
+            return GRADE_BY_GROUP[m.lastgroup]
+    return None
 
 
 def main() -> None:

@@ -196,115 +196,93 @@ class ParsedHadith:
 
 
 # Matches this edition's inline footnote-reference markers as they appear in
-# BODY text, e.g. "...جَرْحَاهُمْ (٢)." — one or more per hadith, numbered
-# starting at 1 WITHIN each hadith (confirmed: a hadith's own markers always
-# restart at "(١)", they are not a running count across the whole page).
-_INLINE_MARKER_RE = re.compile(rf"\(\s*[{DIGITS}]+\s*\)")
+# BODY text, e.g. "...جَرْحَاهُمْ (٢)." ("(¬٢)" in the Sunan editions).
+# Footnotes are numbered PER PAGE: the markers on a page run (١), (٢), (٣)…
+# across however many hadith the page holds, and its footnote area holds
+# segments (١), (٢), (٣)… (checked 2026-09-26: 99% of Musnad pages with
+# markers, the rest are one note referenced twice or a page starting mid-run).
+_INLINE_MARKER_RE = re.compile(rf"\(\s*¬?\s*([{DIGITS}]+)\s*\)")
+_TO_WESTERN = str.maketrans(DIGITS, "0123456789")
+_TO_EASTERN = str.maketrans("0123456789", DIGITS)
 
-# Splits a page's raw "foot" field into its own numbered segments. A leading
-# segment with no "(N)" prefix, itself starting with "=", is Shamela's own
-# convention for "this text continues the last still-open footnote from the
-# previous page" (confirmed real: a footnote whose triggering marker and
-# whose printed text straddle a page break). Every other segment starts with
-# its own "(N)" — but a footnote's own BODY also cites other hadith by
-# number in the exact same "(N)" shape (e.g. "وأخرجه البخاري (٧٤١٢)"), and
-# those must NOT be mistaken for a new footnote boundary. Confirmed
-# discriminator, checked against real data: a true footnote-start marker is
-# always preceded by "." with NO space ("...بهذا الإسناد.(٢) ..."); a
-# citation number is always preceded by a space or other non-period
-# character ("...أخرجه مسلم (١٨١٢) ..."). The lookbehind enforces this.
-_FOOTNOTE_SEGMENT_RE = re.compile(rf"(?<![^.])\(\s*[{DIGITS}]+\s*\)")
+
+def _note_start(foot: str, number: int, pos: int) -> tuple[int, int] | None:
+    """The segment "(number)" of a page's footnote area, at or after pos. A
+    footnote's own text also cites hadith by number ("وأخرجه البخاري (٧٤١٢)",
+    "مسلم (٢٣٨٠) (١٧٢)"), always after a space; a segment start follows the
+    end of the previous note directly ("…بهذا الإسناد.(٢)", "…تحريف(٢)",
+    "…(٢٦٤٥٢)(١)") or opens the area. Returns (start, end) in foot."""
+    for m in re.compile(rf"\(\s*¬?\s*{str(number).translate(_TO_EASTERN)}\s*\)").finditer(foot, pos):
+        if m.start() == 0 or not foot[m.start() - 1].isspace():
+            return m.start(), m.end()
+    return None
 
 
 class _FootnoteAssembler:
-    """Correctly attributes each page's footnote text to the specific hadith
-    (and specific inline marker within that hadith) it actually belongs to.
+    """Gives each hadith the footnotes its own markers point to (2026-09-26
+    rewrite).
 
-    The naive approach — concatenate every page's whole "foot" field and hand
-    it to whichever hadith is still open when that page finishes — is WRONG
-    whenever a hadith's own body ends partway through a page (which is most
-    of the time): that hadith's own footnote ends up attributed to whatever
-    LATER hadith happens to still be pending when the page's foot field is
-    finally read, not to the hadith whose markers it actually explains.
-    Confirmed on real data: hadith #٢٠٧٩٢ has two inline markers "(١)"/"(٢)"
-    in its own body but an empty footnote_text under the naive approach,
-    while its footnote content (including a "=" page-break continuation)
-    was found filed entirely under the NEXT hadith, #٢٠٧٩٣.
-
-    Model: footnotes are typeset at the bottom of the SAME page the
-    triggering body text appears on (with a "=" continuation onto the next
-    page's block when a footnote's own text is long enough to straddle the
-    break). So markers are seen, and footnote segments arrive, in the same
-    left-to-right document order — this is tracked as one FIFO queue rather
-    than per-page state, which is what makes it robust across a hadith body
-    (and its markers) spanning multiple pages.
+    The previous version queued every marker of the book in one FIFO and
+    handed each footnote segment to the oldest waiting marker. Any page
+    where the two counts differ — a heading's own marker, a segment start
+    after a letter ("…وهو تحريف(٢)") that its splitter did not see, footnotes
+    printed in the body — shifted every later footnote by one: on Musnad
+    Ahmad the queue ran 29 deep at the median and up to 189, so a footnote
+    usually reached a hadith ~30 markers away, or none at all (only 3,863 of
+    27,797 hadith got one). Here a marker is matched to the segment with
+    ITS number on ITS page; nothing carries over between pages except a
+    footnote continued at the top of the next page ("= …").
     """
 
     def __init__(self) -> None:
-        self._queue: list[tuple[ParsedHadith, int]] = []
-        self._resolved: dict[tuple[int, int], list[str]] = {}
-        self._last_key: tuple[int, int] | None = None
-        # Counts up per entry and is NEVER decremented by dequeuing — the
-        # queue itself drains as footnotes are consumed, so it can't be used
-        # to derive "how many markers has this entry had so far" once a
-        # multi-page entry's earlier markers have already been resolved.
-        self._entry_marker_count: dict[int, int] = {}
-        # Diagnostics only: the queue length just before each dequeue is a
-        # direct measure of drift (markers seen but not yet footnoted). A
-        # small, bounded value (0-2) is the normal "footnote lands a page
-        # later" case; if this grows unboundedly over the book, the FIFO
-        # assumption is wrong and results should not be trusted blindly.
-        self.max_queue_depth = 0
-        self.queue_depth_at_dequeue: list[int] = []
+        self._page_markers: list[tuple[ParsedHadith, int]] = []
+        self._by_entry: dict[int, list[list[str]]] = {}  # id(entry) -> footnote cells, in order
+        self._last_cell: list[str] | None = None  # the note a "= …" continuation extends
+        self.markers_seen = 0
+        self.markers_unmatched = 0  # diagnostics: a marker whose number the page's notes lack
 
     def note_markers(self, entry: ParsedHadith, text_chunk: str) -> None:
-        """Call with each piece of ORIGINAL (marker-containing) body text as
-        it's appended to `entry`, in order. Registers one queue slot per
-        inline marker found, numbered by position within THIS entry."""
-        for _ in _INLINE_MARKER_RE.finditer(text_chunk):
-            count = self._entry_marker_count.get(id(entry), 0) + 1
-            self._entry_marker_count[id(entry)] = count
-            self._queue.append((entry, count))
-            self.max_queue_depth = max(self.max_queue_depth, len(self._queue))
+        """Call with each piece of ORIGINAL body text of `entry`, in order."""
+        for m in _INLINE_MARKER_RE.finditer(text_chunk):
+            self._page_markers.append((entry, int(m.group(1).translate(_TO_WESTERN))))
 
     def consume_page_foot(self, foot: str) -> None:
-        """Call once per page with that page's raw "foot" field, after every
-        marker on that page has already been registered via note_markers()."""
-        if not foot:
-            return
-        pos = 0
-        first_match = _FOOTNOTE_SEGMENT_RE.search(foot)
-        leading = foot[: first_match.start()] if first_match else foot
-        if leading.lstrip().startswith("="):
-            # continuation of the most recently dequeued marker's footnote,
-            # printed at the top of this page before this page's own "(N)"
-            # segments begin (confirmed real: a footnote long enough to
-            # straddle a page break).
-            if self._last_key is not None:
-                self._resolved.setdefault(self._last_key, []).append(leading.lstrip("= \n"))
-            pos = len(leading)
-        # now split the remainder into (marker, following-text) segments in order
-        matches = list(_FOOTNOTE_SEGMENT_RE.finditer(foot[pos:]))
-        base = pos
-        for i, m in enumerate(matches):
-            seg_start = base + m.start()
-            seg_end = base + matches[i + 1].start() if i + 1 < len(matches) else len(foot)
-            segment_text = foot[seg_start:seg_end]
-            if not self._queue:
-                # no known marker awaiting this text — front matter, a stray
-                # reference, or a genuine gap; do not guess an attribution.
+        """Call once per page, after all of the page's markers were noted."""
+        markers, self._page_markers = self._page_markers, []
+        self.markers_seen += len(markers)
+        foot = foot or ""
+        cells: dict[int, list[str]] = {}
+        starts = []
+        pos, k = 0, 1
+        last_marker = max((n for _, n in markers), default=0)
+        while True:
+            found = _note_start(foot, k, pos)
+            if found is not None:
+                starts.append((k, found[0]))
+                pos = found[1]
+            elif k >= last_marker:
+                break
+            # a number missing from the notes (a misprint: "(١٢" for "(٢)"):
+            # its marker stays without a note, the later numbers still split
+            k += 1
+        lead_end = starts[0][1] if starts else len(foot)
+        if foot[:lead_end].lstrip().startswith("=") and self._last_cell is not None:
+            self._last_cell[0] += " " + foot[:lead_end].strip().lstrip("= \n")
+        for i, (k, at) in enumerate(starts):
+            cells[k] = [foot[at : starts[i + 1][1] if i + 1 < len(starts) else len(foot)]]
+        if starts:
+            self._last_cell = cells[starts[-1][0]]
+        for entry, k in markers:
+            cell = cells.get(k)
+            if cell is None:
+                self.markers_unmatched += 1
                 continue
-            self.queue_depth_at_dequeue.append(len(self._queue))
-            key_entry, key_number = self._queue.pop(0)
-            key = (id(key_entry), key_number)
-            self._resolved.setdefault(key, []).append(segment_text)
-            self._last_key = key
+            mine = self._by_entry.setdefault(id(entry), [])
+            if not any(c is cell for c in mine):
+                mine.append(cell)
 
-    def footnote_for(self, entry: ParsedHadith, marker_count: int) -> str:
-        parts = []
-        for i in range(1, marker_count + 1):
-            parts.extend(self._resolved.get((id(entry), i), []))
-        return "".join(parts).strip()
+    def footnote_for(self, entry: ParsedHadith) -> str:
+        return "".join(c[0] for c in self._by_entry.get(id(entry), [])).strip()
 
 
 def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
@@ -316,7 +294,6 @@ def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
     entries: list[ParsedHadith] = []
     unparsed_log: list[dict] = []
     assembler = _FootnoteAssembler()
-    marker_counts: dict[int, int] = {}
 
     current_heading: str | None = None
     pending: ParsedHadith | None = None
@@ -327,7 +304,6 @@ def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
         if pending is None:
             return
         pending.text = buffer.strip()
-        pending.footnote_text = assembler.footnote_for(pending, marker_counts.get(id(pending), 0))
         pending.page_ids = list(buffer_pages)
         entries.append(pending)
 
@@ -345,9 +321,6 @@ def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
             buffer_pages.append(page_id)
             if pending is not None:
                 assembler.note_markers(pending, chunk)
-                marker_counts[id(pending)] = marker_counts.get(id(pending), 0) + len(
-                    _INLINE_MARKER_RE.findall(chunk)
-                )
             finalize()
             pending = ParsedHadith(serial=m.group(1), heading=current_heading)
             buffer, buffer_pages = "", []
@@ -359,9 +332,6 @@ def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
             buffer_pages.append(page_id)
         if pending is not None and tail_chunk:
             assembler.note_markers(pending, tail_chunk)
-            marker_counts[id(pending)] = marker_counts.get(id(pending), 0) + len(
-                _INLINE_MARKER_RE.findall(tail_chunk)
-            )
 
     for page in pages:
         body = page.get("body") or ""
@@ -399,6 +369,9 @@ def parse_book(pages: list[dict]) -> tuple[list[ParsedHadith], list[dict]]:
             unparsed_log.append({"id": page_id, "reason": "no heading/hadith context yet"})
 
     finalize()
+    # after the whole book: a hadith usually ends before its page's notes are read
+    for e in entries:
+        e.footnote_text = assembler.footnote_for(e)
     return entries, unparsed_log
 
 
@@ -428,6 +401,19 @@ _LABEL_BEFORE_TITLE_RE = re.compile(r"^\s*(?:\[[^\]<]{2,40}\]|أول|تتمة|[�
 # continues the previous volume's musnad; not a new section, not hadith text.
 _CONTINUATION_NOTE_RE = re.compile(r"^\s*﷽?\s*تتمة\s+(?:مسند|حديث)\s[^٠-٩<]{2,80}?(?=[٠-٩]+\s*[-–—]\s)")
 _AHMAD_DATES_RE = re.compile(r"\(?\s*١٦٤\s*[-–—ـ]\s*٢٤١\s*هـ?\s*\)?")
+# A page holding only a row of dots (". . . . ."), the print's end-of-volume
+# / end-of-section separator: 1,863 such pages in Musnad Ahmad, which ran
+# into the hadith before them (1,496 hadith ended in a row of dots).
+_DOTS_ONLY_RE = re.compile(r"[\s.…·]*\.[\s.…·]*")
+# ...and once (Musnad page 25794-5592) a dots row followed by the continuation
+# of the previous page's footnote ("= وأخرجه النسائي…") in the BODY, which
+# became 1,300 characters of hadith #7120's text: it is footnote text.
+_DOTS_THEN_FOOTNOTE_RE = re.compile(r"[\s.…·]*\.[\s.…·]*(?==)")
+# Four more Musnad pages (25794-2233, -4318, -7892, -19474) have an empty
+# footnote field and their footnotes in the body after "=" (Shamela's mark
+# for a note continued from the previous page), so they were stored as the
+# end of hadith #٣١١٧, #٥٦٢٠, #١٠٢٠٠, #٢٣٤٣٣. "=" never occurs in hadith text.
+_TAG_RE = re.compile(r"<[^>]+>")
 # A section heading printed as plain text (not wrapped as a Shamela title):
 # "مسند علي بن أبي طالب (١) ﵁", "حديث عقيل بن أبي طالب", "ومن مسند بني هاشم…"
 _PLAIN_HEADING_RE = re.compile(
@@ -452,12 +438,27 @@ def prepare_pages(pages: list[dict]) -> list[dict]:
        Anas, Jabir …); the headings exist only as plain text, which the
        parser glued onto the previous hadith instead of starting a section.
     4. Editorial end-of-section notes are removed from the end of a page.
+    5. Pages holding only a row of dots (a separator) are emptied; footnote
+       text after such a row, or after "=" on a page whose footnote field is
+       empty, is moved to the page's footnotes.
     Only page-INITIAL headings are converted: a title mid-page would cut the
     previous hadith's tail from it (see parse_book)."""
     out = []
     in_front_matter = False
     for page in sorted(pages, key=lambda p: int(p["id"].split("-")[1])):
         body = page.get("body") or ""
+        if _DOTS_ONLY_RE.fullmatch(body):
+            out.append({**page, "body": ""})
+            continue
+        dots = _DOTS_THEN_FOOTNOTE_RE.match(body)
+        if dots:
+            out.append({**page, "body": "", "foot": body[dots.end() :] + (page.get("foot") or "")})
+            continue
+        if not (page.get("foot") or "").strip():
+            eq = _TAG_RE.sub(lambda t: " " * len(t.group()), body).find("=")
+            if eq >= 0 and body[eq + 1 :].strip():
+                page = {**page, "foot": body[eq:]}
+                body = body[:eq]
         label = _LABEL_BEFORE_TITLE_RE.match(_DIACRITICS_RE.sub("", body))  # the raw text is vowelled
         if label:
             body = body[_find_original_offset(body, label.end()) :]

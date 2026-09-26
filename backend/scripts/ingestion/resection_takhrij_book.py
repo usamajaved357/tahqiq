@@ -19,9 +19,16 @@ parsed entry by printed number, and by text where one printed number covers
 two hadith; the run refuses to write anything unless EVERY row is matched
 exactly once.
 
-Usage: python -m scripts.ingestion.resection_takhrij_book <raw_pages.jsonl> <collection_name> [--apply]
+Usage: python -m scripts.ingestion.resection_takhrij_book <raw_pages.jsonl> <collection_name> [--apply <reviewed_changes.json>]
 Without --apply it only prints the plan (and writes <collection>.resection_plan.json).
+
+Text changes that only restore spaces at page breaks or drop separator dots
+are applied as they come; every other ("substantive") change must be listed
+in reviewed_changes.json — [{"id", "old_sha256", "new_sha256", ...}], written
+from the dry run's plan after each change was read — or nothing is written.
+The hashes make sure the row still holds the text that was reviewed.
 """
+import hashlib
 import json
 import re
 import sys
@@ -39,34 +46,29 @@ TEMP_BOOK_NUMBER_OFFSET = 100000
 _DISAMBIG_RE = re.compile(r"^(.*?)-(\d+)$")
 
 
+def sha256(t: str | None) -> str:
+    return hashlib.sha256((t or "").encode("utf-8")).hexdigest()
+
+
+def only_layout_changed(old: str | None, new: str) -> bool:
+    """Spaces restored at page breaks (parse_book fix 2026-09-26) and/or a
+    separator row of dots dropped (prepare_pages fix 2026-09-26)."""
+    squeeze = lambda t: re.sub(r"\.{2,}", ".", re.sub(r"\s", "", t or ""))
+    return squeeze(old) == squeeze(new)
+
+
 def words(t: str) -> set[str]:
     return set(re.sub(r"[ً-ْٰ]", "", t).split())
 
 
-def main() -> None:
-    if len(sys.argv) not in (3, 4):
-        print(__doc__)
-        sys.exit(1)
-    pages_path, collection_name = sys.argv[1], sys.argv[2]
-    apply = len(sys.argv) == 4 and sys.argv[3] == "--apply"
-
-    entries, _ = parse_book(prepare_pages(load_pages(pages_path)))
-    entries = [e for e in entries if clean_text(e.text)]  # ingest skipped empty ones too
-    print(f"parsed {len(entries)} entries")
-
-    with hadith_db_session() as session:
-        # a plain id, not the ORM object — it is used again after this session closes
-        coll_id = session.scalar(select(HadithCollection.id).filter_by(name=collection_name))
-        rows = session.execute(
-            select(Hadith.id, Hadith.hadith_number, Hadith.text_ar, Hadith.book_id)
-            .join(HadithBook, Hadith.book_id == HadithBook.id)
-            .where(HadithBook.collection_id == coll_id)
-        ).all()
-    print(f"{len(rows)} rows in the database")
-
+def match_entries_to_rows(entries, rows) -> tuple[dict[int, object], list]:
+    """Each row (id, printed number, text, ...) -> its parsed entry, by printed
+    number, and by text overlap where one printed number covers several
+    hadith ("N", "N-2", "N-3" in the database). Returns (assigned, unmatched
+    entries)."""
     # printed number -> rows ("N", and "N-2"/"N-3" for disambiguated duplicates)
     by_number: dict[str, list[tuple[int, str]]] = {}
-    for hid, number, text, _ in rows:
+    for hid, number, text, *_ in rows:
         m = _DISAMBIG_RE.match(number)
         base = m.group(1) if m and m.group(1) and not m.group(1).endswith("-") else number
         by_number.setdefault(base, []).append((hid, text or ""))
@@ -94,6 +96,35 @@ def main() -> None:
             used_e.add(i)
             used_r.add(hid)
         unmatched_entries += [e for i, e in enumerate(es) if i not in used_e]
+    return assigned, unmatched_entries
+
+
+def main() -> None:
+    if len(sys.argv) not in (3, 5):
+        print(__doc__)
+        sys.exit(1)
+    pages_path, collection_name = sys.argv[1], sys.argv[2]
+    apply = len(sys.argv) == 5 and sys.argv[3] == "--apply"
+    if len(sys.argv) != 3 and not apply:
+        print(__doc__)
+        sys.exit(1)
+    reviewed = {r["id"]: r for r in json.load(open(sys.argv[4], encoding="utf-8"))} if apply else {}
+
+    entries, _ = parse_book(prepare_pages(load_pages(pages_path)))
+    entries = [e for e in entries if clean_text(e.text)]  # ingest skipped empty ones too
+    print(f"parsed {len(entries)} entries")
+
+    with hadith_db_session() as session:
+        # a plain id, not the ORM object — it is used again after this session closes
+        coll_id = session.scalar(select(HadithCollection.id).filter_by(name=collection_name))
+        rows = session.execute(
+            select(Hadith.id, Hadith.hadith_number, Hadith.text_ar, Hadith.book_id)
+            .join(HadithBook, Hadith.book_id == HadithBook.id)
+            .where(HadithBook.collection_id == coll_id)
+        ).all()
+    print(f"{len(rows)} rows in the database")
+
+    assigned, unmatched_entries = match_entries_to_rows(entries, rows)
     unmatched_rows = [(hid, n) for hid, n, _, _ in rows if hid not in assigned]
     print(f"rows matched: {len(assigned)}   rows unmatched: {len(unmatched_rows)}   entries unmatched: {len(unmatched_entries)}")
     for hid, n in unmatched_rows[:20]:
@@ -119,10 +150,10 @@ def main() -> None:
             text_changes.append({"id": hid, "number": number, "old": text, "new": clean_text(e.text)})
     kinds = Counter()
     for c in text_changes:
-        # page-break word separation (parse_book fix 2026-09-26) only restores
-        # spaces — counted apart so the few substantive changes stay reviewable
-        if re.sub(r"\s", "", c["new"]) == re.sub(r"\s", "", c["old"] or ""):
-            kinds["whitespace only (fused words at page breaks separated)"] += 1
+        # counted apart so the few substantive changes stay reviewable
+        c["substantive"] = not only_layout_changed(c["old"], c["new"])
+        if not c["substantive"]:
+            kinds["layout only (page-break spaces, separator dots)"] += 1
         elif c["new"] in (c["old"] or "") and len(c["new"]) < len(c["old"] or ""):
             kinds["shortened (glued text removed)"] += 1
         elif (c["old"] or "") in c["new"] and len(c["new"]) > len(c["old"] or ""):
@@ -150,6 +181,17 @@ def main() -> None:
         return
     if unmatched_rows or clashes:
         sys.exit("refusing to apply: every row must match exactly one entry and (section, number) must be unique")
+    unreviewed = [
+        c for c in text_changes
+        if c["substantive"]
+        and (c["id"] not in reviewed
+             or reviewed[c["id"]]["old_sha256"] != sha256(c["old"])
+             or reviewed[c["id"]]["new_sha256"] != sha256(c["new"]))
+    ]
+    if unreviewed:
+        for c in unreviewed[:20]:
+            print(f"   not reviewed: id={c['id']} number={c['number']}")
+        sys.exit(f"refusing to apply: {len(unreviewed)} substantive text changes are not in the reviewed list (or differ from it)")
 
     # only sections that actually hold rows (e.g. the Musnad's introduction
     # parses as a "section" whose one junk row was deleted beforehand)
